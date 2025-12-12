@@ -7,7 +7,11 @@
 **评分细则：**
 
 - 依据本文件“任务一”部分补全代码并顺利编译运行，可获得 **30 分**。
+<<<<<<< HEAD
 - 继续完成任务二、任务三并调好控制器后，将根据轨迹跟踪正确性、稳定性和整体效果再给 **1–40 分**；完成任务三后请自行录制飞行视频 `solutions/video.mp4`，同时运行`code/calculate_results.py`会保存结果文件到`solutions/result.txt`。
+=======
+- 继续完成任务二、任务三并调好控制器后，将根据轨迹跟踪正确性、稳定性和整体效果再给 **1–29 分**；完成任务三后请导出飞行视频 `solutions/video.mp4`。
+>>>>>>> add base A* algo and tragety generator
 - 若完成任务四中的附加题或进行其他有效改进，可依据工作量、效果与新颖性额外获得 **1–10 分**。
 
 **报告要求：**
@@ -43,7 +47,7 @@
 为节省同学们的时间，并且规避环境安装中的各种问题，请各位同学下载已经配置好的环境直接使用，环境下载链接如下（**请提前预留至少 30GB 的空间**）：
 
 ```
-https://pan.baidu.com/s/1S6v2XpLhJtwDtvcuwMVflQ?pwd=gdtb 
+please check in github for the latest link
 ```
 
 在 VMware 的主界面，点击右上角的「文件」→「打开」：
