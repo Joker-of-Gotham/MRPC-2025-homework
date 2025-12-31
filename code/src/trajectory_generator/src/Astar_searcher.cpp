@@ -204,17 +204,13 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
  * 使用 3D 欧氏距离 + 一个 tie_breaker，基于 index 计算（单位和 g_score 一致）
  */
 double Astarpath::getHeu(MappingNodePtr node1, MappingNodePtr node2) {
-  // 在栅格索引空间下计算距离
-  int dx = node1->index(0) - node2->index(0);
-  int dy = node1->index(1) - node2->index(1);
-  int dz = node1->index(2) - node2->index(2);
+  const int dx = node1->index(0) - node2->index(0);
+  const int dy = node1->index(1) - node2->index(1);
+  const int dz = node1->index(2) - node2->index(2);
 
-  double dist = sqrt(dx * dx + dy * dy + dz * dz);
-  // tie-breaker 稍微放大一点，鼓励朝对角线方向前进，减少搜索“抖动”
-  double tie_breaker = 1.0 + 1e-3;
-
-  double heu = tie_breaker * dist;
-  return heu;
+  const double dist = std::sqrt(double(dx * dx + dy * dy + dz * dz));
+  const double tie_breaker = 1.0 + 1e-3;   // 很小即可
+  return tie_breaker * dist;               // 单位与 g_score 一致（index space）
 }
 
 
@@ -224,56 +220,57 @@ double Astarpath::getHeu(MappingNodePtr node1, MappingNodePtr node2) {
 bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
   ros::Time time_1 = ros::Time::now();
 
-  // start_point 和 end_point 索引
+  // 关键：每次搜索前清空历史状态
+  resetUsedGrids();
+  Openset.clear();
+  terminatePtr = NULL;
+
   Vector3i start_idx = coord2gridIndex(start_pt);
-  Vector3i end_idx = coord2gridIndex(end_pt);
+  Vector3i end_idx   = coord2gridIndex(end_pt);
   goalIdx = end_idx;
 
-  //start_point 和 end_point 的位置（栅格中心）
+  // 使用栅格中心点，保持一致性
   start_pt = gridIndex2coord(start_idx);
-  end_pt = gridIndex2coord(end_idx);
+  end_pt   = gridIndex2coord(end_idx);
 
-  // 初始化 start / goal 节点（只用来存储启发和索引等信息）
-  MappingNodePtr startPtr = new MappingNode(start_idx, start_pt);
-  MappingNodePtr endPtr   = new MappingNode(end_idx,   end_pt);
+  // 关键：直接使用地图节点，避免 new 出来的“游离节点”
+  MappingNodePtr startPtr = Map_Node[start_idx(0)][start_idx(1)][start_idx(2)];
+  MappingNodePtr endPtr   = Map_Node[end_idx(0)][end_idx(1)][end_idx(2)];
+  resetGrid(startPtr);
+  resetGrid(endPtr);
 
-  // Openset 是通过 STL 库中的 multimap 实现的 open_list
-  Openset.clear();
-  // currentPtr 表示 open_list 中 f（n） 最低的节点
-  MappingNodePtr currentPtr = NULL;
-  MappingNodePtr neighborPtr = NULL;
-
-  // 将 Start 节点放在 Open Set 中
+  // 初始化 start
   startPtr->g_score = 0.0;
   startPtr->f_score = getHeu(startPtr, endPtr);
-  startPtr->id = 1;              // 1 表示在 open set
-  startPtr->coord = start_pt;
-  startPtr->Father = NULL;
+  startPtr->id      = 1;     // open
+  startPtr->Father  = NULL;
+  startPtr->coord   = start_pt;
+
   Openset.insert(make_pair(startPtr->f_score, startPtr));
+
+  MappingNodePtr currentPtr  = NULL;
+  MappingNodePtr neighborPtr = NULL;
 
   double tentative_g_score;
   vector<MappingNodePtr> neighborPtrSets;
   vector<double> edgeCostSets;
 
-  // 终止节点指针先置空
-  terminatePtr = NULL;
-
   while (!Openset.empty()) {
-    // 1. 取出 f 最小的节点
+    // 1) 取出 f 最小节点
     auto it = Openset.begin();
     currentPtr = it->second;
     Openset.erase(it);
 
-    // 可能存在同一指针多次插入 open set 的情况，如果已经关过就跳过
-    if (currentPtr->id == -1)
-      continue;
+    // 可能存在重复插入，已 close 的直接跳过
+    if (currentPtr->id == -1) continue;
 
-    // 标记为 close set
+    // 标记 close
     currentPtr->id = -1;
 
-    // 2. 判断是否到达终点
+    // 2) 是否到达终点
     if (currentPtr->index == goalIdx) {
       terminatePtr = currentPtr;
+
       ros::Time time_2 = ros::Time::now();
       if ((time_2 - time_1).toSec() > 0.1)
         ROS_WARN("Time consume in Astar path finding is %f",
@@ -281,39 +278,31 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
       return true;
     }
 
-    // 3. 拓展当前节点
+    // 3) 拓展邻居
     AstarGetSucc(currentPtr, neighborPtrSets, edgeCostSets);
 
     for (unsigned int i = 0; i < neighborPtrSets.size(); i++) {
       neighborPtr = neighborPtrSets[i];
-
-      // 已经在 close set 的跳过
-      if (neighborPtr->id == -1)
-        continue;
-
-      // 避开障碍物
-      if (isOccupied(neighborPtr->index))
-        continue;
+      if (neighborPtr->id == -1) continue;                 // close
+      if (isOccupied(neighborPtr->index)) continue;         // obstacle
 
       tentative_g_score = currentPtr->g_score + edgeCostSets[i];
 
-      // 4. 对未访问过的节点
-      if (neighborPtr->id == 0) {  // 0 表示还不在 open / close
-        neighborPtr->Father = currentPtr;
+      // 4) 未访问过：写入信息并放入 open
+      if (neighborPtr->id == 0) {
+        neighborPtr->Father  = currentPtr;
         neighborPtr->g_score = tentative_g_score;
         neighborPtr->f_score = tentative_g_score + getHeu(neighborPtr, endPtr);
-        neighborPtr->id = 1;  // 放入 open
+        neighborPtr->id      = 1;  // open
         Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
         continue;
       }
-      // 5. 已经在 open set 中，检查是否有更优的 g_score
+      // 已在 open：如果更优则更新（允许重复插入，靠 close 跳过旧条目）
       else if (neighborPtr->id == 1) {
         if (tentative_g_score < neighborPtr->g_score) {
           neighborPtr->g_score = tentative_g_score;
-          neighborPtr->f_score =
-              tentative_g_score + getHeu(neighborPtr, endPtr);
-          neighborPtr->Father = currentPtr;
-          // 直接再插入一次，旧的条目在之后会因为 id==-1 被跳过
+          neighborPtr->f_score = tentative_g_score + getHeu(neighborPtr, endPtr);
+          neighborPtr->Father  = currentPtr;
           Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
         }
         continue;
@@ -321,11 +310,11 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
     }
   }
 
-  // open set 为空仍未找到终点，搜索失败
   ros::Time time_2 = ros::Time::now();
   if ((time_2 - time_1).toSec() > 0.1)
     ROS_WARN("Time consume in Astar path finding is %f",
              (time_2 - time_1).toSec());
+
   ROS_WARN("[A*] search failed, no path found.");
   return false;
 }
@@ -343,22 +332,19 @@ vector<Vector3d> Astarpath::getPath() {
     return path;
   }
 
-  // 从终点一路通过 Father 指针回溯到起点
   MappingNodePtr cur = terminatePtr;
   while (cur != NULL) {
-    // 根据 index 重新计算真实坐标（保证在栅格中心）
     cur->coord = gridIndex2coord(cur->index);
     front_path.push_back(cur);
     cur = cur->Father;
   }
 
-  // 当前顺序是 goal -> start，需要反转成 start -> goal
   for (int i = (int)front_path.size() - 1; i >= 0; --i) {
     path.push_back(front_path[i]->coord);
   }
-
   return path;
 }
+
 
 
 std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,

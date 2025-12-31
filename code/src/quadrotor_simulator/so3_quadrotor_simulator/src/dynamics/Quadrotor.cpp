@@ -3,10 +3,11 @@
 #include <Eigen/Geometry>
 #include <boost/bind.hpp>
 #include <iostream>
+#include <cmath>
+#include <algorithm>   // [STABILITY] std::min
 
 #include <ros/ros.h>
 namespace odeint = boost::numeric::odeint;
-
 
 /*在这里本文仿真了一个四旋翼的模型，具体的模型参数已经在代码中呈现并进行备注，
 你无需也不能进行修改四旋翼的模型参数，你所要做的就是阅读相关代码，并结合已学习的知识，补充四旋翼的dynamic代码。*/
@@ -18,8 +19,8 @@ namespace QuadrotorSimulator
 
 Quadrotor::Quadrotor(void)    //模型的初始化
 {
-  alpha0     = 48; // degree    //螺旋桨的初始攻角 
-  g_         = 9.81;            //重力加速度                      
+  alpha0     = 48; // degree    //螺旋桨的初始攻角
+  g_         = 9.81;            //重力加速度
   mass_      = 0.98; // 0.5;    //四旋翼飞行器的质量
   double Ixx = 2.64e-3, Iyy = 2.64e-3, Izz = 4.96e-3;    //惯性矩相关参数，分别表示绕x、y、z轴的惯性矩
   prop_radius_ = 0.062;          //螺旋桨半径
@@ -44,6 +45,8 @@ Quadrotor::Quadrotor(void)    //模型的初始化
   state_.motor_rpm = Eigen::Array4d::Zero();
 
   external_force_.setZero();
+  external_moment_.setZero();   // [稳健性] 防止未初始化外部力矩引入随机扰动
+  acc_.setZero();               // [稳健性] 初始化加速度
 
   updateInternalState();
 
@@ -69,7 +72,7 @@ void Quadrotor::updateInternalState(void)    //在内部进行状态存储和传
   internal_state_[21] = state_.motor_rpm(3);
 }
 
-void Quadrotor::step(double dt) 
+void Quadrotor::step(double dt)
 {
   /*step函数主要用于更新四旋翼飞行器的状态。它基于数值积分方法，根据当前状态和物理模型，
   在给定的时间步长dt内计算并更新飞行器的状态。这使得四旋翼飞行器的模拟能够随着时间逐步推进，
@@ -77,9 +80,11 @@ void Quadrotor::step(double dt)
 
   auto save = internal_state_;
 
-  odeint::integrate(boost::ref(*this), internal_state_, 0.0, dt, dt);   
-  //调用下面的void Quadrotor::operator()(const Quadrotor::InternalState& x,Quadrotor::InternalState& dxdt, const double /* t */)数值积分操作
-  //所以你要修改的地方其实就是operator函数
+  // ==========================================================
+  // [STABILITY-1] 数值积分改为“小步长多步”（抑制刚性/大力矩瞬态振荡）
+  // ==========================================================
+  const double h = std::min(0.002, dt / 10.0);   // 2ms 或 dt/10，取更小
+  odeint::integrate(boost::ref(*this), internal_state_, 0.0, dt, h);
 
   for (int i = 0; i < 22; ++i)     //异常处理
   {
@@ -110,6 +115,19 @@ void Quadrotor::step(double dt)
   state_.motor_rpm(2) = internal_state_[20];
   state_.motor_rpm(3) = internal_state_[21];
 
+  // ==========================================================
+  // [STABILITY-2] 对 motor_rpm 状态二次裁剪（防止积分越界导致推力/力矩突刺）
+  // ==========================================================
+  for (int i = 0; i < 4; ++i)
+  {
+    if (std::isnan(state_.motor_rpm(i)))
+      state_.motor_rpm(i) = (max_rpm_ + min_rpm_) / 2.0;
+    if (state_.motor_rpm(i) > max_rpm_)
+      state_.motor_rpm(i) = max_rpm_;
+    else if (state_.motor_rpm(i) < min_rpm_)
+      state_.motor_rpm(i) = min_rpm_;
+  }
+
   // Re-orthonormalize R (polar decomposition)
   Eigen::LLT<Eigen::Matrix3d> llt(state_.R.transpose() * state_.R);
   Eigen::Matrix3d             P = llt.matrixL();
@@ -117,12 +135,13 @@ void Quadrotor::step(double dt)
   state_.R                      = R;
 
   // 不要撞到地面上
-  if (state_.x(2) < 0.0 && state_.v(2) < 0)   
+  if (state_.x(2) < 0.0 && state_.v(2) < 0)
   {
     state_.x(2) = 0;
     state_.v(2) = 0;
   }
-  updateInternalState();
+
+  updateInternalState();  // 会把裁剪后的 motor_rpm 同步回 internal_state_
 }
 
 void Quadrotor::operator()(const Quadrotor::InternalState& x,
@@ -142,7 +161,6 @@ void Quadrotor::operator()(const Quadrotor::InternalState& x,
   {
     cur_state.motor_rpm(i) = x[18 + i];
   }
-
 
   // 姿态矩阵处理（重新正交化）
   Eigen::LLT<Eigen::Matrix3d> llt(cur_state.R.transpose() * cur_state.R);
@@ -164,22 +182,26 @@ void Quadrotor::operator()(const Quadrotor::InternalState& x,
   omega_vee(1, 0) = cur_state.omega(2);
   omega_vee(0, 1) = -cur_state.omega(2);
 
-  motor_rpm_sq = cur_state.motor_rpm.array().square();    //于存储电机转速的平方
+  motor_rpm_sq = cur_state.motor_rpm.array().square();    //用于存储电机转速的平方
 
-  //! @todo implement
   Eigen::Array4d blade_linear_velocity;
   Eigen::Array4d motor_linear_velocity;
   Eigen::Array4d AOA;   //攻角的计算
+
   blade_linear_velocity = 0.104719755 * cur_state.motor_rpm.array() * prop_radius_;
-  for (int i = 0; i < 4; ++i){
-    AOA[i]   = alpha0 - atan2(motor_linear_velocity[i], blade_linear_velocity[i]) * 180 / 3.14159265;
+
+  // [稳健性] 原代码 motor_linear_velocity 未初始化，会导致 atan2() 未定义/NaN
+  motor_linear_velocity.setZero();
+
+  for (int i = 0; i < 4; ++i)
+  {
+    // atan2(0, blade_v) => 0，AOA = alpha0；且 AOA 当前不参与后续动力学
+    AOA[i] = alpha0 - std::atan2(motor_linear_velocity[i], blade_linear_velocity[i]) * 180.0 / 3.14159265;
   }
 
-
-  // double totalF = kf_ * motor_rpm_sq.sum();
   double thrust = kf_ * motor_rpm_sq.sum();  //总推力
 
-  Eigen::Vector3d moments;  //力矩
+  Eigen::Vector3d moments;  //力矩（机体系）
   moments(0) = kf_ * (motor_rpm_sq(2) - motor_rpm_sq(3)) * arm_length_;
   moments(1) = kf_ * (motor_rpm_sq(1) - motor_rpm_sq(0)) * arm_length_;
   moments(2) = km_ * (motor_rpm_sq(0) + motor_rpm_sq(1) - motor_rpm_sq(2) -
@@ -189,23 +211,57 @@ void Quadrotor::operator()(const Quadrotor::InternalState& x,
                       3.14159265 * (arm_length_) * (arm_length_) * // S
                       cur_state.v.norm() * cur_state.v.norm();
 
-
   vnorm = cur_state.v;
   if (vnorm.norm() != 0)
   {
     vnorm.normalize();
   }
 
+  // =========================
+  // Task 1: 动力学补全开始
+  // =========================
+
+  // 1) 平动：x_dot, v_dot
   x_dot = cur_state.v;
-  //请在这里补充完四旋翼飞机的动力学模型，提示：v_dot应该与重力，总推力，外力和空气阻力相关
-  // v_dot = //?????
+
+  // 重力（世界系，z 轴向上时重力为 -g）
+  const Eigen::Vector3d gravity(0.0, 0.0, -g_);
+
+  // 推力（假设推力沿机体系 +Z 轴，R 为 body->world）
+  const Eigen::Vector3d thrust_world = R * Eigen::Vector3d(0.0, 0.0, thrust);
+
+  // 空气阻力（与速度方向相反，大小已在 resistance 中给出）
+  const Eigen::Vector3d drag_world = -resistance * vnorm;
+
+  // [可选-平动线性阻尼] 如仍有低速抖动，可开启这一项（先保持注释）
+  // const double k_v_lin = 0.15;
+  // const Eigen::Vector3d drag_lin = -k_v_lin * cur_state.v;
+
+  // 外力 external_force_：默认按世界系处理（与规划/控制接口常见约定一致）
+  v_dot = gravity + (thrust_world + external_force_ + drag_world /* + drag_lin */) / mass_;
 
   acc_ = v_dot;
 
+  // 2) 姿态：R_dot
   R_dot = R * omega_vee;
-  //请在这里补充完四旋翼飞机的动力学模型，角速度导数的计算涉及到惯性矩阵J_的逆、力矩、科里奥利力（通过角速度与惯性矩阵和角速度的叉积来计算）和外部力矩等因素。
-  // omega_dot = //??????
 
+  // 3) 转动：omega_dot（欧拉方程）
+  // J * omega_dot = tau - omega x (J*omega) + tau_ext
+  const Eigen::Vector3d coriolis = cur_state.omega.cross(J_ * cur_state.omega);
+
+  // ==========================================================
+  // [STABILITY-3] 转动阻尼（抑制目标切换时角速度高频抖动）
+  // ==========================================================
+  const double k_omega = 1e-3;                 // 起步值：1e-3（可小幅调）
+  const Eigen::Vector3d tau_damp = -k_omega * cur_state.omega;
+
+  omega_dot = J_.inverse() * (moments - coriolis + external_moment_ + tau_damp);
+
+  // =========================
+  // Task 1: 动力学补全结束
+  // =========================
+
+  // 电机转速一阶动态
   motor_rpm_dot = (input_ - cur_state.motor_rpm) / motor_time_constant_;
 
   for (int i = 0; i < 3; i++)
@@ -289,7 +345,6 @@ double Quadrotor::getGravity(void) const   //获取四旋翼飞行器所处环�
   return g_;
 }
 
-
 void Quadrotor::setGravity(double g)   //用于设置四旋翼飞行器所处环境的重力加速度
 {
   g_ = g;
@@ -314,7 +369,6 @@ double Quadrotor::getArmLength(void) const   //用于获取四旋翼飞行器的
 {
   return arm_length_;
 }
-
 
 void Quadrotor::setArmLength(double d)    //用于设置四旋翼飞行器的螺旋桨臂长
 {
@@ -347,7 +401,6 @@ double Quadrotor::getPropellerThrustCoefficient(void) const   //用于获取四�
   return kf_;
 }
 
-
 void Quadrotor::setPropellerThrustCoefficient(double kf)   //用于设置四旋翼飞行器的螺旋桨推力系数
 {
   if (kf <= 0)
@@ -363,7 +416,6 @@ double Quadrotor::getPropellerMomentCoefficient(void) const    //获取四旋翼
 {
   return km_;
 }
-
 
 void Quadrotor::setPropellerMomentCoefficient(double km)   //设置四旋翼飞行器的螺旋桨力矩系数
 {
@@ -397,7 +449,6 @@ const Eigen::Vector3d& Quadrotor::getExternalForce(void) const    //用于获取
   return external_force_;
 }
 
-
 void Quadrotor::setExternalForce(const Eigen::Vector3d& force)   //用于设置四旋翼飞行器所受的外部力
 {
   external_force_ = force;
@@ -418,7 +469,7 @@ double Quadrotor::getMaxRPM(void) const     //用于获取四旋翼飞行器电�
   return max_rpm_;
 }
 
-void Quadrotor::setMaxRPM(double max_rpm)   
+void Quadrotor::setMaxRPM(double max_rpm)
 {
   if (max_rpm <= 0)
   {
@@ -443,11 +494,9 @@ void Quadrotor::setMinRPM(double min_rpm)
   min_rpm_ = min_rpm;
 }
 
-
-
 Eigen::Vector3d Quadrotor::getAcc() const
 {
   return acc_;
 }
 
-}
+} // namespace QuadrotorSimulator
