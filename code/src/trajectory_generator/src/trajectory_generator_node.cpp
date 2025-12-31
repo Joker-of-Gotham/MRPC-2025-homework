@@ -357,7 +357,7 @@ void issafe(const ros::TimerEvent &e){
     Eigen::Vector3d now_pos;
     now_pos = odom_pt;
     Eigen::Vector3i odom_index = _astar_path_finder->c2i(now_pos);
-    if(_astar_path_finder->is_occupy(odom_index) && !cracked){
+    if(_astar_path_finder->is_occupy_raw(odom_index) && !cracked){
       ROS_WARN("now place is in obstacle, the drone has cracked!!!");
       cracked = true;
       if(!dataFiles.is_open()){
@@ -781,6 +781,10 @@ int main(int argc, char **argv)
   exec_state  = INIT;
   time_Count  = 0;
   target_Count = 0;
+  
+  std::string issafe_path = "/home/stuwork/MRPC-2025-homework/code/src/quadrotor_simulator/so3_control/src/issafe.txt";
+  std::ofstream clear_file(issafe_path, std::ios::out | std::ios::trunc);
+  clear_file.close();
 
   _exec_timer    = nh.createTimer(ros::Duration(0.01), execCallback);
   _safety_timer_ = nh.createTimer(ros::Duration(0.05), issafe);

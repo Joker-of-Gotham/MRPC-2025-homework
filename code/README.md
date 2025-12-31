@@ -150,7 +150,7 @@ git clone https://github.com/Dwl2021/MRPC-2025-homework.git
 
 ### 3.1 任务一：补全四旋翼飞机的动力学模型
 
-在 `MRPC-2025-homework/code/src/uav_simulator/so3_quadrotor_simulator/src/dynamics/Quadrotor.cpp` 中描述了四旋翼的动力学模型，请阅读代码 `Quadrotor.cpp`，补充四旋翼的动力学模型：
+在 `MRPC-2025-homework/code/src/quadrotor_simulator/so3_quadrotor_simulator/src/dynamics/Quadrotor.cpp` 中描述了四旋翼的动力学模型，请阅读代码 `Quadrotor.cpp`，补充四旋翼的动力学模型：
 
 ```cpp
 x_dot = cur_state.v;
@@ -198,19 +198,13 @@ roslaunch trajectory_generator test_control.launch
 
 <img src="./assets/image-20251113202128649.png" width="400">
 
-#### 步骤 4：测试移动
-
-点击 Rviz 中的 `3D Nav Goal`，在界面中的白色地板上进行拖动。倘若无人机能够沿着 z 轴向上移动 6m，则表明你的修改成功。倘若飞机不能向上移动则表明修改失败。
-
-<img src="./assets/image-20251113202237918.png" width="400">
-
 
 **提交方式** ：请在报告中稍微介绍一下任务一的补全思路，注意简洁清晰，切勿放大段代码。
 
 
 ### 3.2 任务二：补充无人机的前端规划模块
 
-在 `MRPC-2025-homework/code/src/planner/path_searching/src/kinodynamic_astar.cpp` 中补充完有关于 A* 的相关内容，共有 4 个 `STEP` 需要你补齐。
+在 `MRPC-2025-homework/code/src/trajectory_generator/src/Astar_searcher.cpp` 中补充完有关于 A* 的相关内容，共有 4 个 `STEP` 需要你补齐。
 
 #### STEP 1.1：补全启发式函数
 
@@ -337,7 +331,7 @@ roslaunch trajectory_generator demo.launch
 
 在上面所有的代码都补齐之后，你应该可以编译成功并且进行测试了，但是你会发现飞机对于轨迹的跟踪并不是很好，那么你需要对控制器的参数进行调整。
 
-请阅读 `MRPC-2025-homework/code/src/uav_simulator/so3_control/src/so3_control_nodelet.cpp` 中的控制器代码，并且对 `position_cmd_callback` 函数中的 `kx_` 和 `kv_` 参数进行调整。
+请阅读 `MRPC-2025-homework/code/src/quadrotor_simulator/so3_control/src/so3_control_nodelet.cpp` 中的控制器代码，并且对 `position_cmd_callback` 函数中的 `kx_` 和 `kv_` 参数进行调整。
 
 ```cpp
 void SO3ControlNodelet::position_cmd_callback(

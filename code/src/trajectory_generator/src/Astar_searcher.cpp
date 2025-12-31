@@ -26,6 +26,9 @@ void Astarpath::begin_grid_map(double _resolution, Vector3d global_xyz_l,
   data = new uint8_t[GLXYZ_SIZE];
   memset(data, 0, GLXYZ_SIZE * sizeof(uint8_t));
 
+  data_raw = new uint8_t[GLXYZ_SIZE];
+  memset(data_raw, 0, GLXYZ_SIZE * sizeof(uint8_t));
+
   Map_Node = new MappingNodePtr **[GRID_X_SIZE];
   for (int i = 0; i < GRID_X_SIZE; i++) {
     Map_Node[i] = new MappingNodePtr *[GRID_Y_SIZE];
@@ -63,6 +66,8 @@ void Astarpath::set_barrier(const double coord_x, const double coord_y,
   int idx_x = static_cast<int>((coord_x - gl_xl) * inv_resolution);
   int idx_y = static_cast<int>((coord_y - gl_yl) * inv_resolution);
   int idx_z = static_cast<int>((coord_z - gl_zl) * inv_resolution);
+
+  data_raw[idx_x * GLYZ_SIZE + idx_y * GRID_Z_SIZE + idx_z] = 1;
 
   if (idx_x == 0 || idx_y == 0 || idx_z == GRID_Z_SIZE || idx_x == GRID_X_SIZE ||
       idx_y == GRID_Y_SIZE)
@@ -134,6 +139,15 @@ inline bool Astarpath::isOccupied(const Eigen::Vector3i &index) const {
 
 bool Astarpath::is_occupy(const Eigen::Vector3i &index) {
   return isOccupied(index(0), index(1), index(2));
+}
+
+bool Astarpath::is_occupy_raw(const Eigen::Vector3i &index) {
+  int idx_x = index(0);
+  int idx_y = index(1);
+  int idx_z = index(2);
+  return (idx_x >= 0 && idx_x < GRID_X_SIZE && idx_y >= 0 && idx_y < GRID_Y_SIZE &&
+          idx_z >= 0 && idx_z < GRID_Z_SIZE &&
+          (data_raw[idx_x * GLYZ_SIZE + idx_y * GRID_Z_SIZE + idx_z] == 1));
 }
 
 inline bool Astarpath::isFree(const Eigen::Vector3i &index) const {
@@ -457,8 +471,10 @@ int Astarpath::safeCheck(MatrixXd polyCoeff, VectorXd time) {
 }
 
 void Astarpath::resetOccupy(){
-      for (int i = 0; i < GRID_X_SIZE; i++)
-    for (int j = 0; j < GRID_Y_SIZE; j++)
-      for (int k = 0; k < GRID_Z_SIZE; k++)
-        data[i * GLYZ_SIZE + j * GRID_Z_SIZE + k] = 0;
+  for (int i = 0; i < GRID_X_SIZE; i++)
+for (int j = 0; j < GRID_Y_SIZE; j++)
+  for (int k = 0; k < GRID_Z_SIZE; k++) {
+    data[i * GLYZ_SIZE + j * GRID_Z_SIZE + k] = 0;
+    data_raw[i * GLYZ_SIZE + j * GRID_Z_SIZE + k] = 0;
+  }
 }

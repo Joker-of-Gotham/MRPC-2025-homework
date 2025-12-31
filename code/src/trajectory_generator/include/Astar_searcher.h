@@ -14,6 +14,7 @@ class Astarpath
 
 	protected:
 		uint8_t * data;
+		uint8_t * data_raw;
 		MappingNodePtr *** Map_Node;
 		Eigen::Vector3i goalIdx;
 		int GRID_X_SIZE, GRID_Y_SIZE, GRID_Z_SIZE;
@@ -45,6 +46,7 @@ class Astarpath
 		void resetGrid(MappingNodePtr ptr);
 		void resetUsedGrids();
 		bool is_occupy(const Eigen::Vector3i & index);
+		bool is_occupy_raw(const Eigen::Vector3i & index);
 		Eigen::Vector3i c2i(const Eigen::Vector3d & pt);
 
 		void begin_grid_map(double _resolution, Eigen::Vector3d global_xyz_l, Eigen::Vector3d global_xyz_u, int max_x_id, int max_y_id, int max_z_id);
