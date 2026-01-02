@@ -52,20 +52,23 @@
     
     <!-- A* 搜索参数 -->
     <param name="astar_max_search_time"     value="0.35"/>
-    <param name="astar_hard_clearance_xy"   value="1"/>
+    <!-- hard-clearance：提高到 2 格（0.4m@0.2m 分辨率），避免走“看似能过但实际会擦撞”的小缝 -->
+    <param name="astar_hard_clearance_xy"   value="2"/>
     <param name="astar_hard_clearance_z"    value="0"/>
     <param name="astar_soft_clearance_range_m" value="0.60"/>
-    <param name="astar_soft_clearance_weight"  value="0.50"/>
+    <!-- soft-clearance：更偏好大间距通道（仍允许绕行时更安全） -->
+    <param name="astar_soft_clearance_weight"  value="0.90"/>
     <!-- set_barrier 的点云栅格膨胀：设太大容易把可通过的缝堵死 -->
     <param name="astar_inflation_xy_base" value="0.0"/>
     <param name="astar_inflation_z_base"  value="0.0"/>
 
     <!-- 轨迹前瞻碰撞预测（障碍进入视野后能立刻触发重规划） -->
-    <param name="collision_check_horizon" value="1.2"/>
+    <param name="collision_check_horizon" value="2.0"/>
     <param name="collision_check_dt"      value="0.05"/>
-    <!-- 默认仅对“真实占据”触发重规划，避免缝隙处频繁抖动 -->
-    <param name="collision_check_use_clearance" value="false"/>
-    <param name="collision_check_min_clearance_m" value="0.15"/>
+    <!-- 前瞻碰撞：默认启用 clearance 阈值 + 连续命中抑制噪声 -->
+    <param name="collision_check_use_clearance" value="true"/>
+    <param name="collision_check_min_clearance_m" value="0.25"/>
+    <param name="collision_check_consecutive_hits" value="3"/>
 
     <!-- 到位判定（目标附近不再抖动/乱跑） -->
     <param name="goal_tolerance"      value="0.45"/>

@@ -3,6 +3,7 @@
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <iostream>
+#include <cmath>
 #include <math.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
@@ -92,6 +93,7 @@ bool trajOptimization(const Eigen::MatrixXd &path, const Eigen::MatrixXd &path_r
 void rcvOdomCallback(const nav_msgs::Odometry::ConstPtr &odom);
 void rcvWaypointsCallBack(const nav_msgs::Path &wp);
 void rcvPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map);
+void abortTrajServer();
 void trajPublish(MatrixXd polyCoeff, VectorXd time);
 bool trajGeneration();
 VectorXd timeAllocation(MatrixXd Path);
@@ -237,6 +239,7 @@ void execCallback(const ros::TimerEvent &e)
       {
         has_traj   = false;
         has_target = false;
+        abortTrajServer();  // 防止 traj_server 继续沿旧轨迹“跑过头/折返”
         changeState(WAIT_TARGET, "GOAL_REACHED");
         return;
       }
@@ -251,6 +254,7 @@ void execCallback(const ros::TimerEvent &e)
         if (dist_to_goal < goal_tol && odom_vel.norm() < vel_tol)
         {
           has_target = false;
+          abortTrajServer();
           changeState(WAIT_TARGET, "STATE");
         }
         else
@@ -350,18 +354,23 @@ void rcvWaypointsCallBack(const nav_msgs::Path &wp)
 void rcvPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map)
 {
   pcl::PointCloud<pcl::PointXYZ> cloud;
-
-  _astar_path_finder->resetOccupy();  // 新的一帧点云到来，需将占据容器清零；
-
   pcl::fromROSMsg(pointcloud_map, cloud);
 
   if ((int)cloud.points.size() == 0)
+  {
+    // 关键修复：点云为空时不要清空上一帧占据栅格。
+    // 否则会在“短暂空帧/转换失败/视野裁剪导致空帧”时把地图清成全空，出现穿障与误判安全。
+    ROS_WARN_THROTTLE(1.0, "[map] local_pointcloud empty, keep last occupancy map.");
     return;
+  }
+
+  _astar_path_finder->resetOccupy();  // 仅当本帧点云有效时，才清空并写入新占据
 
   pcl::PointXYZ pt;
   for (int idx = 0; idx < (int)cloud.points.size(); idx++)
   {
     pt = cloud.points[idx];
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
     // set obstacles into grid map for path planning
     _astar_path_finder->set_barrier(pt.x, pt.y, pt.z);
   }
@@ -450,6 +459,17 @@ void issafe(const ros::TimerEvent &e)
       ROS_WARN("[issafe] failed to open issafe.txt for writing");
     }
   }
+}
+
+// 立即让 traj_server 进入 HOVER（停止继续沿旧轨迹走），用于“到点后仍往回飞/反复折返”等情况
+void abortTrajServer()
+{
+  quadrotor_msgs::PolynomialTrajectory msg;
+  msg.header.stamp    = ros::Time::now();
+  msg.header.frame_id = "world";
+  msg.action          = quadrotor_msgs::PolynomialTrajectory::ACTION_ABORT;
+  msg.trajectory_id   = 0;
+  _traj_pub.publish(msg);
 }
 
 bool trajOptimization(const Eigen::MatrixXd &path_in, const Eigen::MatrixXd &path_raw_in)
@@ -818,16 +838,20 @@ bool trajUnsafeAhead(double t_now, double horizon_s)
   ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
   ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
 
-  // 为了避免“缝明明能过却反复重规划/乱飞”，默认只对“真实占据”触发重规划。
-  // 如需更保守，可开启 use_clearance 并设置最小 clearance（米）。
-  bool   use_clearance = false;
-  double min_clearance_m = 0.15;
-  ros::param::param("~collision_check_use_clearance", use_clearance, false);
-  ros::param::param("~collision_check_min_clearance_m", min_clearance_m, 0.15);
+  // 关键：若只用“中心点落入占据格”作为触发，会出现“擦边撞上去”但不重规划的问题。
+  // 因此默认启用 clearance 阈值；同时用“连续命中”抑制噪声，避免缝隙处抖动。
+  bool   use_clearance = true;
+  double min_clearance_m = 0.25;
+  int    consec_hits_need = 3;
+  ros::param::param("~collision_check_use_clearance", use_clearance, true);
+  ros::param::param("~collision_check_min_clearance_m", min_clearance_m, 0.25);
+  ros::param::param("~collision_check_consecutive_hits", consec_hits_need, 3);
 
   double dt = 0.05;  // 20Hz 预测检查
   ros::param::param("~collision_check_dt", dt, 0.05);
   const double t_end = std::max(t_now, std::min(time_duration, t_now + std::max(0.2, horizon_s)));
+
+  static int consec_hits = 0;
 
   for (double t = t_now; t <= t_end + 1e-9; t += dt)
   {
@@ -846,7 +870,16 @@ bool trajUnsafeAhead(double t_now, double horizon_s)
     {
       // 使用距离场近似（局部扫描）来做“近碰撞”判断，避免 hard-clearance 过于二值化导致频繁触发
       const double clr = _astar_path_finder->nearestObsDistM(idx, 8);
-      if (clr < std::max(0.0, min_clearance_m)) return true;
+      if (clr < std::max(0.0, min_clearance_m))
+      {
+        consec_hits++;
+        if (consec_hits >= std::max(1, consec_hits_need))
+          return true;
+      }
+      else
+      {
+        consec_hits = 0;
+      }
 
       // 可选：如果你仍想保留 hard-clearance 的语义（但只在非常贴近时触发）
       if (_astar_path_finder->isTooCloseHard(idx, hard_xy_cells, hard_z_cells) &&

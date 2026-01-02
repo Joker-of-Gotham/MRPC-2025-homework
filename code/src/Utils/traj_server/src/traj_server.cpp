@@ -145,18 +145,13 @@ public:
         _vis_cmd.header = _odom.header;
         _vis_cmd.header.frame_id = "world";
 
-        if(state == INIT && fabs(_odom.pose.pose.position.z  - 1.0) < 0.1 )
-            cmd_flag = true;
-
         if(state == INIT )
         {
             //ROS_WARN("[TRAJ SERVER] Pub initial pos command");
             _cmd.position   = _odom.pose.pose.position;
-            
-            if(!cmd_flag)
-                _cmd.position.z =  1.5;
-            else
-                _cmd.position.z =  1.5;
+            // 关键修复：不要在 INIT 阶段强制 z=1.5（本作业仿真初始 z=2.0），
+            // 否则会产生较长时间的 0.5m 级稳态误差，显著拉高全程 RMSE。
+            // 直接保持当前高度悬停，等待收到轨迹后再进入 TRAJ。
             
             _cmd.header.stamp = _odom.header.stamp;
             _cmd.header.frame_id = "world";
