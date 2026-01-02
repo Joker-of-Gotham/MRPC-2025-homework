@@ -23,18 +23,31 @@ static constexpr double kMinGoalZUp   = 1e-3;       // treat near-zero as "inval
 static constexpr double kInflationBaseM  = 0.30;    // base safety buffer
 static constexpr double kInflationZBaseM = 0.25;    // mild Z inflation
 
-// minimum clearance constraint for shortcut segments (meters)
-// if segment samples have clearance < this => reject shortcut (prevents narrow gaps)
-static constexpr double kMinClearanceM = 0.45;
-
-// clearance probing (local, cheap) in cells
-static constexpr int    kClearProbeRCells = 6;      // probe radius in cells
-static constexpr double kClearOpenCapM    = 6.0;    // if no obstacle within probe => treat as open
-
 // LoS sampling step (meters)
 static inline double segStep(double res) {
   return std::max(0.05, 0.5 * res);
 }
+
+// -------------------------------
+// NEW: forward-cone sparsification knobs
+// -------------------------------
+static constexpr double kForwardConeHalfAngleDeg = 30.0; // only forward ~30deg affects density
+static constexpr double kForwardRayCastAngleDeg  = 20.0; // sample rays within cone (approx)
+static constexpr double kForwardLookaheadM       = 6.0;  // how far to look ahead for obstacles
+static constexpr double kMinSplitLenM            = 1.2;  // never split below this (avoid micro segments)
+
+// NEW: if start/goal is in inflated occupied cell, snap to nearest free within this radius (cells)
+static constexpr int    kNearestFreeMaxRCells    = 10;
+
+// -------------------------------
+// NEW: store continuous (non-grid-rounded) start/goal for endpoint anchoring
+// (Fixes: "RMSE small but not reaching RViz goal", since rounding to grid center causes mismatch)
+// -------------------------------
+namespace {
+static Eigen::Vector3d g_start_cont(0, 0, 0);
+static Eigen::Vector3d g_goal_cont(0, 0, 0);
+static bool            g_have_cont = false;
+} // namespace
 
 void Astarpath::begin_grid_map(double _resolution, Vector3d global_xyz_l,
                                Vector3d global_xyz_u, int max_x_id,
@@ -128,7 +141,7 @@ void Astarpath::set_barrier(const double coord_x, const double coord_y,
       const int ny = idx_y + dy;
       if (nx < 0 || nx >= GRID_X_SIZE || ny < 0 || ny >= GRID_Y_SIZE) continue;
 
-      // disk-ish inflation in XY (optional but helps)
+      // disk-ish inflation in XY
       if (dx*dx + dy*dy > infl_xy*infl_xy) continue;
 
       for (int dz = -infl_z; dz <= infl_z; ++dz) {
@@ -267,7 +280,7 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
   }
 }
 
-// 3D diagonal distance heuristic (admissible baseline) + tie-breaker
+// 3D diagonal distance heuristic + tie-breaker
 double Astarpath::getHeu(MappingNodePtr node1, MappingNodePtr node2) {
   int dx = std::abs(node1->index(0) - node2->index(0));
   int dy = std::abs(node1->index(1) - node2->index(1));
@@ -297,27 +310,96 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
     end_pt(2) = start_pt(2);
   }
 
+  // Clamp continuous endpoints into map (do NOT round to grid here)
+  auto clampd = [&](double v, double lo, double hi) -> double {
+    return std::max(lo, std::min(hi, v));
+  };
+  auto clampIntoMap = [&](Vector3d p) -> Vector3d {
+    p(0) = clampd(p(0), gl_xl + 1e-3, gl_xu - 1e-3);
+    p(1) = clampd(p(1), gl_yl + 1e-3, gl_yu - 1e-3);
+    p(2) = clampd(p(2), gl_zl + 1e-3, gl_zu - 1e-3);
+    return p;
+  };
+
+  start_pt = clampIntoMap(start_pt);
+  end_pt   = clampIntoMap(end_pt);
+
+  // Store continuous endpoints for later anchoring (Fix: "not reaching RViz goal")
+  g_start_cont = start_pt;
+  g_goal_cont  = end_pt;
+  g_have_cont  = true;
+
   Vector3i start_idx = coord2gridIndex(start_pt);
   Vector3i end_idx   = coord2gridIndex(end_pt);
   goalIdx = end_idx;
 
-  start_pt = gridIndex2coord(start_idx);
-  end_pt   = gridIndex2coord(end_idx);
+  // If start/goal cell becomes occupied after inflation, snap to nearest free
+  auto findNearestFree = [&](const Vector3i& center, int max_r, Vector3i& out_idx) -> bool {
+    if (!isOccupied(center)) { out_idx = center; return true; }
+    double best_d2 = 1e18;
+    bool found = false;
+
+    for (int r = 1; r <= max_r; ++r) {
+      for (int dx = -r; dx <= r; ++dx) {
+        for (int dy = -r; dy <= r; ++dy) {
+          for (int dz = -r; dz <= r; ++dz) {
+            // only check the "shell" for speed
+            if (std::abs(dx) != r && std::abs(dy) != r && std::abs(dz) != r) continue;
+
+            Vector3i cand = center + Vector3i(dx, dy, dz);
+            if (cand(0) < 0 || cand(0) >= GRID_X_SIZE ||
+                cand(1) < 0 || cand(1) >= GRID_Y_SIZE ||
+                cand(2) < 0 || cand(2) >= GRID_Z_SIZE) continue;
+
+            if (!isOccupied(cand)) {
+              const double d2 = double(dx*dx + dy*dy + dz*dz);
+              if (d2 < best_d2) {
+                best_d2 = d2;
+                out_idx = cand;
+                found = true;
+              }
+            }
+          }
+        }
+      }
+      if (found) return true;
+    }
+    return false;
+  };
+
+  if (isOccupied(start_idx)) {
+    Vector3i s2;
+    if (findNearestFree(start_idx, kNearestFreeMaxRCells, s2)) {
+      ROS_WARN("[A*] start in inflated obstacle, snap to nearest free cell.");
+      start_idx = s2;
+      g_start_cont = gridIndex2coord(start_idx); // keep consistent with executable endpoint
+    } else {
+      ROS_WARN("[A*] start in obstacle cell, abort.");
+      return false;
+    }
+  }
+  if (isOccupied(end_idx)) {
+    Vector3i g2;
+    if (findNearestFree(end_idx, kNearestFreeMaxRCells, g2)) {
+      ROS_WARN("[A*] goal in inflated obstacle, snap to nearest free cell.");
+      end_idx = g2;
+      goalIdx = end_idx;
+      g_goal_cont = gridIndex2coord(end_idx); // target becomes reachable goal
+    } else {
+      ROS_WARN("[A*] goal in obstacle cell, abort.");
+      return false;
+    }
+  }
+
+  // Planning nodes use grid centers (stable)
+  Vector3d start_grid = gridIndex2coord(start_idx);
+  Vector3d goal_grid  = gridIndex2coord(end_idx);
 
   MappingNodePtr startPtr = Map_Node[start_idx(0)][start_idx(1)][start_idx(2)];
   MappingNodePtr endPtr   = Map_Node[end_idx(0)][end_idx(1)][end_idx(2)];
 
-  startPtr->coord = start_pt;
-  endPtr->coord   = end_pt;
-
-  if (isOccupied(startPtr->index)) {
-    ROS_WARN("[A*] start in obstacle cell, abort.");
-    return false;
-  }
-  if (isOccupied(endPtr->index)) {
-    ROS_WARN("[A*] goal in obstacle cell, abort.");
-    return false;
-  }
+  startPtr->coord = start_grid;
+  endPtr->coord   = goal_grid;
 
   startPtr->g_score = 0.0;
   startPtr->f_score = startPtr->g_score + kWAstarW * getHeu(startPtr, endPtr);
@@ -325,6 +407,25 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
   startPtr->Father = NULL;
 
   Openset.insert(make_pair(startPtr->f_score, startPtr));
+
+  // NEW: local LoS check for "analytic expansion" near the goal (Lazy-Theta* style)
+  const double los_step = segStep(resolution);
+  auto insideMap = [&](const Vector3d& p) -> bool {
+    return (p(0) >= gl_xl && p(0) < gl_xu &&
+            p(1) >= gl_yl && p(1) < gl_yu &&
+            p(2) >= gl_zl && p(2) < gl_zu);
+  };
+  auto segmentFreeInflated = [&](const Vector3d& a, const Vector3d& b) -> bool {
+    const double L = (b - a).norm();
+    const int N = std::max(1, (int)std::ceil(L / los_step));
+    for (int i = 0; i <= N; ++i) {
+      const double t = (double)i / (double)N;
+      const Vector3d p = a + t * (b - a);
+      if (!insideMap(p)) return false;
+      if (isOccupied(coord2gridIndex(p))) return false;
+    }
+    return true;
+  };
 
   vector<MappingNodePtr> neighborPtrSets;
   vector<double> edgeCostSets;
@@ -344,6 +445,22 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
         ROS_WARN("Time consume in Astar path finding is %f",
                  (time_2 - time_1).toSec());
       return true;
+    }
+
+    // NEW: if close enough to goal and there is direct LoS, connect and finish early
+    // (reduces expansions and yields straighter terminal segment)
+    const double dist_to_goal = (gridIndex2coord(currentPtr->index) - goal_grid).norm();
+    if (dist_to_goal < 6.0) {
+      if (segmentFreeInflated(gridIndex2coord(currentPtr->index), goal_grid)) {
+        endPtr->Father = currentPtr;
+        terminatePtr = endPtr;
+
+        ros::Time time_2 = ros::Time::now();
+        if ((time_2 - time_1).toSec() > 0.1)
+          ROS_WARN("Time consume in Astar path finding is %f",
+                   (time_2 - time_1).toSec());
+        return true;
+      }
     }
 
     currentPtr->id = -1;
@@ -400,17 +517,41 @@ vector<Vector3d> Astarpath::getPath() {
   for (int i = (int)front_path.size() - 1; i >= 0; --i)
     path.push_back(front_path[i]->coord);
 
+  // NEW: anchor endpoints to continuous start/goal (avoid grid-center mismatch)
+  if (g_have_cont && !path.empty()) {
+    path.front() = g_start_cont;
+    path.back()  = g_goal_cont;
+  }
+
   return path;
 }
 
 // ------------------------------------------------------------
-// Path post-processing: LoS prune + fillet + clearance-adaptive sparsify
-// Goal: fewer waypoints in open space, keep safety in narrow gaps, smoother corners.
+// Path post-processing:
+// 1) LoS prune (aggressive; only collision-free, not clearance-based)
+// 2) Light fillet at sharp corners (only if safe)
+// 3) NEW: forward-cone-aware sparsification (open => very sparse; only forward 30deg + close obstacles densify)
+// This directly addresses: "too many intermediate nodes => vel=0 at each => slow in open area"
 // ------------------------------------------------------------
 std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
                                               double path_resolution) {
   if (path.empty()) return {};
   if (path.size() == 1) return path;
+
+  auto clampd = [&](double v, double lo, double hi) -> double {
+    return std::max(lo, std::min(hi, v));
+  };
+  auto clampIntoMap = [&](Vector3d p) -> Vector3d {
+    p(0) = clampd(p(0), gl_xl + 1e-3, gl_xu - 1e-3);
+    p(1) = clampd(p(1), gl_yl + 1e-3, gl_yu - 1e-3);
+    p(2) = clampd(p(2), gl_zl + 1e-3, gl_zu - 1e-3);
+    return p;
+  };
+  auto insideMap = [&](const Vector3d& p) -> bool {
+    return (p(0) >= gl_xl && p(0) < gl_xu &&
+            p(1) >= gl_yl && p(1) < gl_yu &&
+            p(2) >= gl_zl && p(2) < gl_zu);
+  };
 
   // 0) de-duplicate consecutive points
   std::vector<Vector3d> clean;
@@ -419,61 +560,36 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   for (size_t i = 1; i < path.size(); ++i) {
     if ((path[i] - clean.back()).norm() > 1e-4) clean.push_back(path[i]);
   }
-  if (clean.size() <= 2) return clean;
+  if (clean.size() <= 2) {
+    if (g_have_cont && clean.size() >= 1) clean.front() = clampIntoMap(g_start_cont);
+    if (g_have_cont && clean.size() >= 2) clean.back()  = clampIntoMap(g_goal_cont);
+    return clean;
+  }
+
+  // NEW: anchor endpoints before pruning
+  if (g_have_cont) {
+    clean.front() = clampIntoMap(g_start_cont);
+    clean.back()  = clampIntoMap(g_goal_cont);
+  } else {
+    clean.front() = clampIntoMap(clean.front());
+    clean.back()  = clampIntoMap(clean.back());
+  }
 
   const double los_step = segStep(resolution);
 
-  auto insideMap = [&](const Vector3d& p) -> bool {
-    return (p(0) >= gl_xl && p(0) < gl_xu &&
-            p(1) >= gl_yl && p(1) < gl_yu &&
-            p(2) >= gl_zl && p(2) < gl_zu);
-  };
-
-  // approx clearance at point: nearest occupied within probe radius; if none => open cap
-  auto approxClearance = [&](const Vector3d& p) -> double {
-    if (!insideMap(p)) return 0.0;
-    const Vector3i idx = coord2gridIndex(p);
-
-    bool found = false;
-    double best = 1e9;
-
-    for (int dx = -kClearProbeRCells; dx <= kClearProbeRCells; ++dx) {
-      for (int dy = -kClearProbeRCells; dy <= kClearProbeRCells; ++dy) {
-        for (int dz = -kClearProbeRCells; dz <= kClearProbeRCells; ++dz) {
-          Vector3i q = idx + Vector3i(dx, dy, dz);
-          if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
-              q(1) < 0 || q(1) >= GRID_Y_SIZE ||
-              q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-          if (isOccupied(q)) {
-            found = true;
-            const double d = std::sqrt(double(dx*dx + dy*dy + dz*dz)) * resolution;
-            if (d < best) best = d;
-          }
-        }
-      }
-    }
-    if (!found) return kClearOpenCapM;
-    return best;
-  };
-
-  // segment validity: collision-free AND keep minimum clearance
-  auto segmentValid = [&](const Vector3d& a, const Vector3d& b) -> bool {
+  auto segmentFreeInflated = [&](const Vector3d& a, const Vector3d& b) -> bool {
     const double L = (b - a).norm();
     const int N = std::max(1, (int)std::ceil(L / los_step));
     for (int i = 0; i <= N; ++i) {
       const double t = (double)i / (double)N;
       const Vector3d p = a + t * (b - a);
-
       if (!insideMap(p)) return false;
       if (isOccupied(coord2gridIndex(p))) return false;
-
-      const double clr = approxClearance(p);
-      if (clr < kMinClearanceM) return false;
     }
     return true;
   };
 
-  // 1) LoS greedy pruning (A* post-smoothing / Theta*-style shortcutting)
+  // 1) LoS greedy pruning (Theta*/Lazy-Theta* style shortcutting)
   std::vector<Vector3d> pruned;
   pruned.reserve(clean.size());
   size_t i = 0;
@@ -481,26 +597,19 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   while (i < clean.size() - 1) {
     size_t j = clean.size() - 1;
     for (; j > i + 1; --j) {
-      if (segmentValid(clean[i], clean[j])) break;
+      if (segmentFreeInflated(clean[i], clean[j])) break;
     }
     pruned.push_back(clean[j]);
     i = j;
   }
-  if (pruned.size() <= 2) {
-    // still OK; will be sparsified below
-  }
 
-  // 2) Corner fillet (very light): insert two points around sharp corners if safe
+  // 2) Light fillet around sharp turns (avoid unnecessary stop-go at corners)
   std::vector<Vector3d> fillet;
   fillet.reserve(pruned.size() * 2);
   fillet.push_back(pruned.front());
 
-  auto clampd = [&](double v, double lo, double hi) -> double {
-    return std::max(lo, std::min(hi, v));
-  };
-
-  const double fillet_max = std::max(0.60, 3.0 * resolution);
-  const double angle_thr  = 0.35; // rad (~20deg) : only fillet meaningful turns
+  const double fillet_max = std::max(0.80, 4.0 * resolution);
+  const double angle_thr  = 0.40; // rad (~23deg)
 
   for (size_t k = 1; k + 1 < pruned.size(); ++k) {
     const Vector3d A = pruned[k - 1];
@@ -522,13 +631,12 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
     const double cosang = clampd(u1.dot(u2), -1.0, 1.0);
     const double ang = std::acos(cosang);
 
-    // nearly straight -> keep
     if (ang < angle_thr) {
       fillet.push_back(B);
       continue;
     }
 
-    const double d = std::min(fillet_max, 0.30 * std::min(L1, L2));
+    const double d = std::min(fillet_max, 0.25 * std::min(L1, L2));
     if (d < 2.0 * resolution) {
       fillet.push_back(B);
       continue;
@@ -537,8 +645,7 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
     const Vector3d B1 = B - u1 * d;
     const Vector3d B2 = B + u2 * d;
 
-    // accept fillet only if safe
-    if (segmentValid(A, B1) && segmentValid(B1, B2) && segmentValid(B2, C)) {
+    if (segmentFreeInflated(A, B1) && segmentFreeInflated(B1, B2) && segmentFreeInflated(B2, C)) {
       fillet.push_back(B1);
       fillet.push_back(B2);
     } else {
@@ -547,87 +654,159 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   }
   fillet.push_back(pruned.back());
 
-  // 3) Clearance-adaptive max-segment sparsification (open => long segments, near => short)
-  auto segmentMinClearance = [&](const Vector3d& a, const Vector3d& b) -> double {
-    const double L = (b - a).norm();
-    const double step = std::max(0.40, 2.0 * resolution);
-    const int N = std::max(1, (int)std::ceil(L / step));
-    double minc = kClearOpenCapM;
-    for (int i = 0; i <= N; ++i) {
-      const double t = (double)i / (double)N;
-      const Vector3d p = a + t * (b - a);
-      minc = std::min(minc, approxClearance(p));
+  // 3) NEW: forward-cone-aware sparsification (this is the 핵심 for speed)
+  //    Only obstacles ahead (≈30°) and close enough cause densification; side obstacles do NOT.
+  const double cone_half_rad = kForwardConeHalfAngleDeg * M_PI / 180.0;
+  const double ray_ang_rad   = kForwardRayCastAngleDeg  * M_PI / 180.0;
+
+  auto rayHitDistRaw = [&](const Vector3d& p0, const Vector3d& dir_in, double max_d) -> double {
+    Vector3d dir = dir_in;
+    const double n = dir.norm();
+    if (n < 1e-6) return max_d;
+    dir /= n;
+
+    const double step = std::max(0.05, 0.5 * resolution);
+    const int N = std::max(1, (int)std::ceil(max_d / step));
+
+    for (int i = 1; i <= N; ++i) {
+      const double s = i * step;
+      Vector3d p = p0 + dir * s;
+      if (!insideMap(p)) return max_d;
+      if (is_occupy_raw(coord2gridIndex(p))) {
+        return s;
+      }
     }
-    return minc;
+    return max_d;
   };
 
-  // set three regimes by clearance
-  const double max_len_open = std::max(4.0, 12.0 * path_resolution);
-  const double max_len_mid  = std::max(2.0,  6.0 * path_resolution);
-  const double max_len_near = std::max(1.0,  3.0 * path_resolution);
+  auto forwardClearanceApprox = [&](const Vector3d& p, const Vector3d& dir) -> double {
+    Vector3d d = dir;
+    const double n = d.norm();
+    if (n < 1e-6) return kForwardLookaheadM;
+    d /= n;
+
+    // build a stable local frame (right, up2)
+    Vector3d up(0, 0, 1);
+    if (std::abs(d.dot(up)) > 0.95) up = Vector3d(0, 1, 0);
+    Vector3d right = d.cross(up).normalized();
+    Vector3d up2   = right.cross(d).normalized();
+
+    // rays inside forward cone (center + yaw± + pitch±)
+    double best = kForwardLookaheadM;
+    best = std::min(best, rayHitDistRaw(p, d, kForwardLookaheadM));
+    best = std::min(best, rayHitDistRaw(p, (d * std::cos(ray_ang_rad) + right * std::sin(ray_ang_rad)).normalized(), kForwardLookaheadM));
+    best = std::min(best, rayHitDistRaw(p, (d * std::cos(ray_ang_rad) - right * std::sin(ray_ang_rad)).normalized(), kForwardLookaheadM));
+    best = std::min(best, rayHitDistRaw(p, (d * std::cos(ray_ang_rad) + up2   * std::sin(ray_ang_rad)).normalized(), kForwardLookaheadM));
+    best = std::min(best, rayHitDistRaw(p, (d * std::cos(ray_ang_rad) - up2   * std::sin(ray_ang_rad)).normalized(), kForwardLookaheadM));
+    return best;
+  };
+
+  auto chooseMaxLenByForward = [&](double fwd_clear_m) -> double {
+    // Larger clearance => fewer waypoints => faster (because Vel/Acc are forced to 0 at waypoints in your traj generator)
+    // The thresholds are tuned for your "open vs near obstacle" behavior.
+    const double base_scale = std::max(1.0, path_resolution);
+
+    if (fwd_clear_m >= 4.5) return 12.0 * base_scale;
+    if (fwd_clear_m >= 3.0) return 8.0  * base_scale;
+    if (fwd_clear_m >= 2.0) return 5.0  * base_scale;
+    if (fwd_clear_m >= 1.3) return 3.0  * base_scale;
+    return 1.5 * base_scale;
+  };
+
+  // local nudge for INTERNAL points only (endpoints must remain anchored)
+  auto nudgeToFreeInflated = [&](const Vector3d& p_in) -> Vector3d {
+    Vector3d p = clampIntoMap(p_in);
+    Vector3i idx = coord2gridIndex(p);
+    if (!isOccupied(idx)) return p;
+
+    // very small local search (keep it cheap and stable)
+    const int r = 2;
+    double best_d2 = 1e18;
+    bool found = false;
+    Vector3i best = idx;
+
+    for (int dx = -r; dx <= r; ++dx)
+      for (int dy = -r; dy <= r; ++dy)
+        for (int dz = -r; dz <= r; ++dz) {
+          Vector3i c = idx + Vector3i(dx, dy, dz);
+          if (c(0) < 0 || c(0) >= GRID_X_SIZE ||
+              c(1) < 0 || c(1) >= GRID_Y_SIZE ||
+              c(2) < 0 || c(2) >= GRID_Z_SIZE) continue;
+          if (!isOccupied(c)) {
+            const double d2 = double(dx*dx + dy*dy + dz*dz);
+            if (d2 < best_d2) {
+              best_d2 = d2;
+              best = c;
+              found = true;
+            }
+          }
+        }
+
+    if (found) return gridIndex2coord(best);
+    return p; // fallback (should be rare)
+  };
 
   std::vector<Vector3d> out;
   out.reserve(fillet.size() * 2);
   out.push_back(fillet.front());
 
-  double maxSegObserved = 0.0;
-
-  const int local_search_r = 1;
+  int total_splits = 0;
 
   for (size_t s = 0; s + 1 < fillet.size(); ++s) {
     const Vector3d a = fillet[s];
     const Vector3d b = fillet[s + 1];
-    const double L = (b - a).norm();
-    maxSegObserved = std::max(maxSegObserved, L);
+    const Vector3d dir = (b - a);
+    const double L = dir.norm();
 
-    const double minc = segmentMinClearance(a, b);
+    if (L < 1e-6) continue;
 
-    double max_len = max_len_mid;
-    if (minc >= 2.0) max_len = max_len_open;
-    else if (minc >= 1.0) max_len = max_len_mid;
-    else max_len = max_len_near;
+    // Forward clearance sampled at a + mid (approximates the 30deg forward influence)
+    const Vector3d mid = a + 0.5 * (b - a);
+    const double fwd_a   = forwardClearanceApprox(a, dir);
+    const double fwd_mid = forwardClearanceApprox(mid, dir);
+    const double fwd_clear = std::min(fwd_a, fwd_mid);
 
-    // split only if needed
-    const int N = std::max(1, (int)std::ceil(L / max_len));
+    double max_len = chooseMaxLenByForward(fwd_clear);
+    max_len = std::max(max_len, kMinSplitLenM);
+
+    // If the segment is collision-free, we still may split only when forward clearance is small.
+    // This is intentionally a "speed control by waypoint count" mechanism (matches your traj generator behavior).
+    int N = std::max(1, (int)std::ceil(L / max_len));
+
+    // Safety: avoid pathological over-splitting
+    N = std::min(N, 10);
+
+    total_splits += (N - 1);
 
     for (int k = 1; k <= N; ++k) {
       const double t = (double)k / (double)N;
       Vector3d p = a + t * (b - a);
 
-      // local nudge if rounding hits occupied
-      if (!insideMap(p)) {
-        // fallback: clamp into map bounds
-        p(0) = clampd(p(0), gl_xl + 1e-3, gl_xu - 1e-3);
-        p(1) = clampd(p(1), gl_yl + 1e-3, gl_yu - 1e-3);
-        p(2) = clampd(p(2), gl_zl + 1e-3, gl_zu - 1e-3);
+      const bool is_last_point = (s + 1 == fillet.size() - 1) && (k == N);
+      const bool is_first_point = (s == 0) && (k == 1);
+
+      // Keep endpoints anchored exactly (fix "end not reached")
+      if (is_first_point) p = fillet[1]; // keep continuity; start already in out[0]
+      if (is_last_point)  p = fillet.back();
+
+      // Internal points: nudge if discretization makes them fall into occupied inflated voxel
+      if (!is_last_point) {
+        p = nudgeToFreeInflated(p);
       }
 
-      Vector3i idx = coord2gridIndex(p);
-      if (isOccupied(idx)) {
-        bool found = false;
-        for (int dx = -local_search_r; dx <= local_search_r && !found; ++dx)
-          for (int dy = -local_search_r; dy <= local_search_r && !found; ++dy)
-            for (int dz = -local_search_r; dz <= local_search_r && !found; ++dz) {
-              Vector3i cand = idx + Vector3i(dx, dy, dz);
-              if (cand(0) < 0 || cand(0) >= GRID_X_SIZE ||
-                  cand(1) < 0 || cand(1) >= GRID_Y_SIZE ||
-                  cand(2) < 0 || cand(2) >= GRID_Z_SIZE) continue;
-              if (!isOccupied(cand)) {
-                idx = cand;
-                found = true;
-              }
-            }
-        p = gridIndex2coord(idx);
-      }
-
-      // avoid re-introducing duplicates
       if ((p - out.back()).norm() > 1e-4) out.push_back(p);
     }
   }
 
-  ROS_WARN("[pathSimplify] in=%d clean=%d pruned=%d fillet=%d out=%d maxSegObs=%.3f (open/mid/near max=%.2f/%.2f/%.2f)",
+  // Final anchor (hard guarantee)
+  if (g_have_cont && !out.empty()) {
+    out.front() = clampIntoMap(g_start_cont);
+    out.back()  = clampIntoMap(g_goal_cont);
+  }
+
+  ROS_WARN("[pathSimplify] in=%d clean=%d pruned=%d fillet=%d out=%d total_splits=%d",
            (int)path.size(), (int)clean.size(), (int)pruned.size(), (int)fillet.size(), (int)out.size(),
-           maxSegObserved, max_len_open, max_len_mid, max_len_near);
+           total_splits);
 
   return out;
 }
