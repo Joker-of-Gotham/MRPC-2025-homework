@@ -27,8 +27,6 @@
 using namespace std;
 using namespace Eigen;
 
-std::ofstream dataFiles;
-
 TrajectoryGeneratorWaypoint *_trajGene = new TrajectoryGeneratorWaypoint();
 Astarpath *_astar_path_finder        = new Astarpath();
 
@@ -90,7 +88,7 @@ void visTrajectory(MatrixXd polyCoeff, VectorXd time);
 void visTrajectory_before(MatrixXd polyCoeff, VectorXd time);
 void visPath(MatrixXd nodes);
 void visPathA(MatrixXd nodes);
-void trajOptimization(Eigen::MatrixXd path);
+bool trajOptimization(const Eigen::MatrixXd &path, const Eigen::MatrixXd &path_raw);
 void rcvOdomCallback(const nav_msgs::Odometry::ConstPtr &odom);
 void rcvWaypointsCallBack(const nav_msgs::Path &wp);
 void rcvPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map);
@@ -295,18 +293,9 @@ void execCallback(const ros::TimerEvent &e)
       const double t_delta = 0.05;  // 50ms
       t_cur = std::max(0.0, std::min(time_duration, t_cur + t_delta));
 
-      Vector3d pos, vel, acc;
-      if (evalTraj(t_cur, &pos, &vel, &acc))
-      {
-        start_pt  = pos;
-        start_vel = vel;
-      }
-      else
-      {
-        // fallback：用真实里程计
-        start_pt  = odom_pt;
-        start_vel = odom_vel;
-      }
+      // 用真实里程计作为重规划边界条件：减少“停-走-停”与由于预测误差带来的抖动
+      start_pt  = odom_pt;
+      start_vel = odom_vel;
 
       // *** REPLAN 时也先发一次当前 PositionCommand，防止控制器断指令
       publishPositionCommand(t_cur);
@@ -393,15 +382,15 @@ bool trajGeneration()
   // Reset map for next call
   _astar_path_finder->resetUsedGrids();
 
-  MatrixXd path(int(grid_path.size()), 3);
+  MatrixXd path_raw(int(grid_path.size()), 3);
   for (int k = 0; k < int(grid_path.size()); k++)
   {
-    path.row(k) = grid_path[k].transpose();
+    path_raw.row(k) = grid_path[k].transpose();
   }
-  visPathA(path);
+  visPathA(path_raw);
 
   grid_path = _astar_path_finder->pathSimplify(grid_path, _path_resolution);
-  path      = MatrixXd::Zero(int(grid_path.size()), 3);
+  MatrixXd path = MatrixXd::Zero(int(grid_path.size()), 3);
   for (int k = 0; k < int(grid_path.size()); k++)
   {
     path.row(k) = grid_path[k].transpose();
@@ -417,7 +406,12 @@ bool trajGeneration()
     return false;
   }
 
-  trajOptimization(path);
+  if (!trajOptimization(path, path_raw))
+  {
+    ROS_WARN("[trajGeneration] trajOptimization failed (unsafe).");
+    has_traj = false;
+    return false;
+  }
   time_duration   = _polyTime.sum();
   time_traj_start = ros::Time::now();
   has_traj        = (_polyCoeff.rows() > 0);
@@ -441,180 +435,79 @@ void issafe(const ros::TimerEvent &e)
     ROS_WARN("now place is in obstacle, the drone has cracked!!!");
     cracked = true;
 
-    if (!dataFiles.is_open())
+    // 关键：立刻写入并 flush/close，确保评测脚本能稳定读到碰撞标志（即便 roslaunch 强制杀进程）
+    const char *kIssafePath =
+        "/home/stuwork/MRPC-2025-homework/code/src/quadrotor_simulator/"
+        "so3_control/src/issafe.txt";
+    std::ofstream f(kIssafePath, std::ios::out | std::ios::trunc);
+    if (f)
     {
-      dataFiles.open("/home/stuwork/MRPC-2025-homework/code/src/"
-                     "quadrotor_simulator/so3_control/src/issafe.txt",
-                     std::ios::out | std::ios::trunc);
+      f << 1 << std::endl;
+      f.flush();
     }
-
-    dataFiles << 1;
+    else
+    {
+      ROS_WARN("[issafe] failed to open issafe.txt for writing");
+    }
   }
 }
 
-void trajOptimization(Eigen::MatrixXd path)
+bool trajOptimization(const Eigen::MatrixXd &path_in, const Eigen::MatrixXd &path_raw_in)
 {
-  if (path.rows() < 2)
-  {
-    ROS_WARN("[trajOptimization] path has less than 2 points, skip!");
-    return;
-  }
+  auto try_generate = [&](const Eigen::MatrixXd &path, const char *tag) -> bool {
+    if (path.rows() < 2)
+      return false;
 
-  // Store the original goal to ensure it's not lost
-  Eigen::Vector3d original_goal = path.row(path.rows() - 1).transpose();
+    MatrixXd vel = MatrixXd::Zero(2, 3);
+    MatrixXd acc = MatrixXd::Zero(2, 3);
+    vel.row(0) = start_vel.transpose();
+    vel.row(1) << 0, 0, 0;
+    acc.row(0) << 0, 0, 0;
+    acc.row(1) << 0, 0, 0;
 
-  MatrixXd vel = MatrixXd::Zero(2, 3);
-  MatrixXd acc = MatrixXd::Zero(2, 3);
-  vel.row(0) = start_vel.transpose();
-  vel.row(1) << 0, 0, 0;
-  acc.row(0) << 0, 0, 0;
-  acc.row(1) << 0, 0, 0;
+    _polyTime  = timeAllocation(path);
+    _polyCoeff = _trajGene->PolyQPGeneration(_dev_order, path, vel, acc, _polyTime);
 
-  _polyTime = timeAllocation(path);
-  _polyCoeff =
-      _trajGene->PolyQPGeneration(_dev_order, path, vel, acc, _polyTime);
-
-  // check if the trajectory is safe, if not, do reoptimize
-  visTrajectory_before(_polyCoeff, _polyTime);
-  int      unsafe_segment = -1;
-  MatrixXd repath;
-  bool     regen_flag = false;
-  int      max_iterations = 20;  // Prevent infinite loop
-  int      iteration = 0;
-
-  unsafe_segment = _astar_path_finder->safeCheck(_polyCoeff, _polyTime);
-
-  while (unsafe_segment != -1 && iteration < max_iterations)
-  {
-    iteration++;
-    regen_flag = true;
-
-    // 安全检查：确保 unsafe_segment 有效
-    if (unsafe_segment < 0 || unsafe_segment >= path.rows() - 1)
+    const int unsafe_segment = _astar_path_finder->safeCheck(_polyCoeff, _polyTime);
+    if (unsafe_segment != -1)
     {
-      ROS_WARN("[trajOptimization] Invalid unsafe_segment=%d, breaking.", unsafe_segment);
-      break;
+      ROS_WARN("[trajOptimization] %s traj unsafe at seg=%d (rows=%d).", tag, unsafe_segment, (int)path.rows());
+      return false;
     }
 
-    // Create new path with one more point
-    repath = MatrixXd::Zero(path.rows() + 1, path.cols());
+    visPath(path);
+    visTrajectory(_polyCoeff, _polyTime);
+    return true;
+  };
 
-    // Copy points from 0 to unsafe_segment (inclusive)
-    for (int i = 0; i <= unsafe_segment; i++)
-    {
-      repath.row(i) = path.row(i);
-    }
-
-    // Insert middle point between unsafe_segment and unsafe_segment+1
-    // 使用更智能的中间点：考虑安全性
-    Eigen::Vector3d p1 = path.row(unsafe_segment).transpose();
-    Eigen::Vector3d p2 = path.row(unsafe_segment + 1).transpose();
-    Eigen::Vector3d mid_point = (p1 + p2) / 2.0;
-
-    // 更强的中间点选择：同时检查 hard-clearance + 线段采样（降低“穿障/贴障”）
-    int hard_xy_cells = 1, hard_z_cells = 0;
-    ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
-    ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
-
-    const double step = std::max(0.05, 0.5 * _resolution);
-
-    auto pointSafe = [&](const Eigen::Vector3d &p) -> bool {
-      const Eigen::Vector3i idx = _astar_path_finder->c2i(p);
-      if (_astar_path_finder->is_occupy(idx)) return false;
-      if (_astar_path_finder->isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return false;
-      return true;
-    };
-
-    auto segmentSafe = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) -> bool {
-      const double L = (b - a).norm();
-      const int N = std::max(1, (int)std::ceil(L / step));
-      for (int ii = 0; ii <= N; ++ii) {
-        const double t = (double)ii / (double)N;
-        const Eigen::Vector3d p = a + t * (b - a);
-        if (!pointSafe(p)) return false;
-      }
-      return true;
-    };
-
-    auto clearanceM = [&](const Eigen::Vector3d &p) -> double {
-      const Eigen::Vector3i idx = _astar_path_finder->c2i(p);
-      return _astar_path_finder->nearestObsDistM(idx, 6);
-    };
-
-    // 先用原 mid_point 试一次
-    bool mid_ok = pointSafe(mid_point) && segmentSafe(p1, mid_point) && segmentSafe(mid_point, p2);
-    if (!mid_ok) {
-      // 在 mid_point 周围做小范围搜索：优先“更大间距 + 更小偏移”
-      Eigen::Vector3d best = mid_point;
-      double bestScore = 1e100;
-      bool found = false;
-
-      for (int r = 1; r <= 4; ++r) {
-        for (int dx = -r; dx <= r; ++dx) {
-          for (int dy = -r; dy <= r; ++dy) {
-            for (int dz = -std::min(2, r); dz <= std::min(2, r); ++dz) {
-              Eigen::Vector3d cand = mid_point + Eigen::Vector3d(dx, dy, dz) * _resolution;
-              if (!pointSafe(cand)) continue;
-              if (!segmentSafe(p1, cand)) continue;
-              if (!segmentSafe(cand, p2)) continue;
-
-              const double clr = clearanceM(cand);
-              const double off2 = (double)(dx*dx + dy*dy) + 0.5 * (double)(dz*dz);
-              // score：偏移越小越好，间距越大越好
-              const double score = 1.0 * off2 - 6.0 * clr;
-              if (score < bestScore) {
-                bestScore = score;
-                best = cand;
-                found = true;
-              }
-            }
-          }
-        }
-        if (found) break;
-      }
-
-      if (found) {
-        mid_point = best;
-        mid_ok = true;
-      } else {
-        ROS_WARN("[trajOptimization] Cannot find safe mid-point (hard-clearance). Keep original mid.");
-      }
-    }
-    
-    repath.row(unsafe_segment + 1) = mid_point.transpose();
-
-    ROS_INFO("[trajOptimization] Adding middle point at segment %d: (%.2f, %.2f, %.2f)", 
-             unsafe_segment, mid_point(0), mid_point(1), mid_point(2));
-
-    // Copy remaining points (shift by 1)
-    for (int i = unsafe_segment + 1; i < path.rows(); i++)
-    {
-      repath.row(i + 1) = path.row(i);
-    }
-
-    // 关键：确保最后一个点始终是原始目标
-    repath.row(repath.rows() - 1) = original_goal.transpose();
-
-    path      = repath;
-    _polyTime = timeAllocation(path);
-    _polyCoeff =
-        _trajGene->PolyQPGeneration(_dev_order, path, vel, acc, _polyTime);
-    unsafe_segment = _astar_path_finder->safeCheck(_polyCoeff, _polyTime);
-  }
-
-  if (iteration >= max_iterations)
+  if (path_in.rows() < 2)
   {
-    ROS_WARN("[trajOptimization] Max iterations reached, using current path.");
+    ROS_WARN("[trajOptimization] path has less than 2 points, fail!");
+    _polyCoeff.resize(0, 0);
+    _polyTime.resize(0);
+    return false;
   }
 
-  if (regen_flag)
+  // 1) 先用简化后的路径生成（更快、更少段）
+  if (try_generate(path_in, "simplified"))
+    return true;
+
+  // 2) 回退：用更密的原始 A* 路径（减少多项式“抄近路”穿障的概率）
+  Eigen::MatrixXd raw = path_raw_in;
+  if (raw.rows() >= 2)
   {
-    ROS_INFO("[trajOptimization] Regeneration success after %d iterations, final path has %d points.",
-             iteration, (int)path.rows());
+    // 确保端点与当前规划一致（目标点永不变）
+    raw.row(0) = path_in.row(0);
+    raw.row(raw.rows() - 1) = path_in.row(path_in.rows() - 1);
   }
 
-  visPath(path);
-  visTrajectory(_polyCoeff, _polyTime);
+  if (try_generate(raw, "raw"))
+    return true;
+
+  ROS_WARN("[trajOptimization] failed to generate a safe trajectory (simplified+raw).");
+  _polyCoeff.resize(0, 0);
+  _polyTime.resize(0);
+  return false;
 }
 
 // 关键：traj_server 内部用“归一化时间” s=t/T 来评估多项式，
@@ -683,12 +576,12 @@ VectorXd timeAllocation(MatrixXd Path)
 
   // 可调的时间缩放与最小段时长：提高可跟踪性，降低 RMSE/抖动
   static bool inited = false;
-  static double time_scale = 2.0;
-  static double min_seg_time = 0.5;
+  static double time_scale = 1.5;
+  static double min_seg_time = 0.2;
   if (!inited)
   {
-    ros::param::param("~planning/time_scale", time_scale, 2.0);
-    ros::param::param("~planning/min_seg_time", min_seg_time, 0.5);
+    ros::param::param("~planning/time_scale", time_scale, 1.5);
+    ros::param::param("~planning/min_seg_time", min_seg_time, 0.2);
     inited = true;
   }
 
@@ -915,7 +808,7 @@ bool evalTraj(double t_cur, Vector3d *pos, Vector3d *vel, Vector3d *acc)
   return false;
 }
 
-// 预测未来一段轨迹是否会碰撞（使用最新占据栅格 + hard-clearance）
+// 预测未来一段轨迹是否会碰撞（使用最新占据栅格；可选基于 clearance 的“近碰撞”触发）
 bool trajUnsafeAhead(double t_now, double horizon_s)
 {
   if (!has_traj) return false;
@@ -924,6 +817,13 @@ bool trajUnsafeAhead(double t_now, double horizon_s)
   int hard_xy_cells = 1, hard_z_cells = 0;
   ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
   ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+
+  // 为了避免“缝明明能过却反复重规划/乱飞”，默认只对“真实占据”触发重规划。
+  // 如需更保守，可开启 use_clearance 并设置最小 clearance（米）。
+  bool   use_clearance = false;
+  double min_clearance_m = 0.15;
+  ros::param::param("~collision_check_use_clearance", use_clearance, false);
+  ros::param::param("~collision_check_min_clearance_m", min_clearance_m, 0.15);
 
   double dt = 0.05;  // 20Hz 预测检查
   ros::param::param("~collision_check_dt", dt, 0.05);
@@ -941,7 +841,18 @@ bool trajUnsafeAhead(double t_now, double horizon_s)
 
     const Vector3i idx = _astar_path_finder->c2i(pos);
     if (_astar_path_finder->is_occupy(idx)) return true;
-    if (_astar_path_finder->isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return true;
+
+    if (use_clearance)
+    {
+      // 使用距离场近似（局部扫描）来做“近碰撞”判断，避免 hard-clearance 过于二值化导致频繁触发
+      const double clr = _astar_path_finder->nearestObsDistM(idx, 8);
+      if (clr < std::max(0.0, min_clearance_m)) return true;
+
+      // 可选：如果你仍想保留 hard-clearance 的语义（但只在非常贴近时触发）
+      if (_astar_path_finder->isTooCloseHard(idx, hard_xy_cells, hard_z_cells) &&
+          clr < std::max(0.0, min_clearance_m + 1e-3))
+        return true;
+    }
   }
 
   return false;

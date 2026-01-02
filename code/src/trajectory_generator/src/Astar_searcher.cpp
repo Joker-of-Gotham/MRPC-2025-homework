@@ -140,17 +140,19 @@ void Astarpath::set_barrier(const double coord_x, const double coord_y,
     inited = true;
   }
 
-  // IMPORTANT: keep inflation modest, but do NOT rely on this alone.
-  // We will add hard-clearance checks at query time.
-  double infl_xy_base = 0.35;
-  double infl_z_base  = 0.25;
-  ros::param::param("~astar_inflation_xy_base", infl_xy_base, 0.35);
-  ros::param::param("~astar_inflation_z_base",  infl_z_base,  0.25);
+  // IMPORTANT:
+  // - 这里的膨胀只用于把“点云离散化”后的栅格障碍连成片；
+  // - 真正的安全距离主要由 A* 的 hard-clearance / safeCheck 来保证。
+  // 过大的 set_barrier 膨胀会把可通过的“缝”堵死，导致后期 A* time budget hit/乱规划。
+  double infl_xy_base = 0.0;
+  double infl_z_base  = 0.0;
+  ros::param::param("~astar_inflation_xy_base", infl_xy_base, 0.0);
+  ros::param::param("~astar_inflation_z_base",  infl_z_base,  0.0);
 
   const double infl_xy_m = std::max(0.0, infl_xy_base + margin_m);
   const double infl_z_m  = std::max(0.0, infl_z_base  + 0.5 * margin_m);
 
-  const int infl_xy = std::max(1, (int)std::ceil(infl_xy_m / resolution));
+  const int infl_xy = std::max(0, (int)std::ceil(infl_xy_m / resolution));
   const int infl_z  = std::max(0, (int)std::ceil(infl_z_m  / resolution));
 
   for (int dx = -infl_xy; dx <= infl_xy; ++dx) {
@@ -1161,6 +1163,7 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
     return pushSeg(out.back(), p, 0);
   };
 
+  bool push_failed = false;
   for (size_t s = 0; s + 1 < fillet.size(); ++s) {
     const Vector3d a0 = out.back();
     const Vector3d b0 = fillet[s + 1];
@@ -1186,11 +1189,13 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
       Vector3d p = a0 + t * (b0 - a0);
 
       if (!pushChecked(p)) {
-        // stop at last safe prefix; do not output unsafe tail
-        ROS_WARN("[pathSimplify] pushChecked failed. Return safe prefix only.");
+        // stop at last safe prefix
+        push_failed = true;
+        ROS_WARN("[pathSimplify] pushChecked failed. Fallback to raw A* path.");
         break;
       }
     }
+    if (push_failed) break;
   }
 
   // final de-dup
@@ -1199,6 +1204,13 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   final_out.push_back(out.front());
   for (size_t ii = 1; ii < out.size(); ++ii) {
     if ((out[ii] - final_out.back()).norm() > 1e-4) final_out.push_back(out[ii]);
+  }
+
+  // 如果 push 过程失败或输出点太少，则回退到更保守的 clean（基本等同原始 A* 网格路径，避免 out=1 导致规划失败/卡死）
+  if (push_failed || final_out.size() < 2) {
+    ROS_WARN("[pathSimplify] fallback: push_failed=%d out=%d -> return clean=%d",
+             (int)push_failed, (int)final_out.size(), (int)clean.size());
+    return clean;
   }
 
   // 若确实到达了 goalIdx，则用连续目标点覆盖末端（更精确）
@@ -1294,6 +1306,6 @@ void Astarpath::resetOccupy() {
     for (int j = 0; j < GRID_Y_SIZE; j++)
       for (int k = 0; k < GRID_Z_SIZE; k++) {
         data[i * GLYZ_SIZE + j * GRID_Z_SIZE + k] = 0;
-        data_raw[i * GLYZ_SIZE + j * GRID_Y_SIZE + k] = 0;
+        data_raw[i * GLYZ_SIZE + j * GRID_Z_SIZE + k] = 0;
       }
 }

@@ -31,9 +31,9 @@
     <param name="planning/acc"       value="2.0"/>
     <param name="planning/dev_order" value="3"/>
     <param name="planning/min_order" value="3"/>
-    <!-- 时间分配（越大越稳、RMSE 更小；但总时间会变长） -->
-    <param name="planning/time_scale"   value="2.0"/>
-    <param name="planning/min_seg_time" value="0.5"/>
+    <!-- 时间分配：适度放缓即可提升可跟踪性；过大将显著拉长总时间 -->
+    <param name="planning/time_scale"   value="1.5"/>
+    <param name="planning/min_seg_time" value="0.2"/>
 
     <!-- 可视化与地图参数 -->
     <param name="vis/vis_traj_width" value="0.07"/>
@@ -51,15 +51,21 @@
     <param name="path/resolution" value="0.2"/>
     
     <!-- A* 搜索参数 -->
-    <param name="astar_max_search_time"     value="0.25"/>
+    <param name="astar_max_search_time"     value="0.35"/>
     <param name="astar_hard_clearance_xy"   value="1"/>
     <param name="astar_hard_clearance_z"    value="0"/>
     <param name="astar_soft_clearance_range_m" value="0.60"/>
-    <param name="astar_soft_clearance_weight"  value="0.80"/>
+    <param name="astar_soft_clearance_weight"  value="0.50"/>
+    <!-- set_barrier 的点云栅格膨胀：设太大容易把可通过的缝堵死 -->
+    <param name="astar_inflation_xy_base" value="0.0"/>
+    <param name="astar_inflation_z_base"  value="0.0"/>
 
     <!-- 轨迹前瞻碰撞预测（障碍进入视野后能立刻触发重规划） -->
     <param name="collision_check_horizon" value="1.2"/>
     <param name="collision_check_dt"      value="0.05"/>
+    <!-- 默认仅对“真实占据”触发重规划，避免缝隙处频繁抖动 -->
+    <param name="collision_check_use_clearance" value="false"/>
+    <param name="collision_check_min_clearance_m" value="0.15"/>
 
     <!-- 到位判定（目标附近不再抖动/乱跑） -->
     <param name="goal_tolerance"      value="0.45"/>
