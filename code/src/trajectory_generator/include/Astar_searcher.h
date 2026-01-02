@@ -60,6 +60,10 @@ class Astarpath
 		int safeCheck( Eigen::MatrixXd polyCoeff, Eigen::VectorXd time);
 		double perpendicularDistance(const Eigen::Vector3d point_insert,const Eigen::Vector3d point_st,const Eigen::Vector3d point_end);
         void resetOccupy();
+		double nearestObsDistM(const Eigen::Vector3i &idx, int max_r_cells) const;
+		bool   isTooCloseHard(const Eigen::Vector3i &idx, int hard_xy_cells, int hard_z_cells) const;
+		double softClearancePenalty(const Eigen::Vector3i &idx, double soft_range_m, int soft_scan_cells) const;
+
 };
 
 
