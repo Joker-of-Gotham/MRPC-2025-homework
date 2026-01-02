@@ -197,27 +197,7 @@ void SO3ControlNodelet::position_cmd_callback(
   des_acc_ = Eigen::Vector3d(cmd->acceleration.x, cmd->acceleration.y,
                              cmd->acceleration.z);
 
-  /**
-   * 控制器增益参数 - 优化版本
-   * 
-   * 综合多个参考实现后的调参结果：
-   * - 使用适中的增益值避免振荡和抖动
-   * - 保持足够的阻尼比确保稳定性
-   * - Z方向略高增益以保持高度稳定
-   * 
-   * 与 gains_hummingbird.yaml 保持一致
-   */
-  
-  // 位置增益 - 适中值，平衡响应速度和稳定性
-  const double kx_xy = 5.5;
-  const double kx_z = 6.0;
-  
-  // 速度增益 - 提供良好阻尼
-  const double kv_xy = 3.5;
-  const double kv_z = 4.0;
-
-  kx_ = Eigen::Vector3d(kx_xy, kx_xy, kx_z);
-  kv_ = Eigen::Vector3d(kv_xy, kv_xy, kv_z);
+  // kx_/kv_ 在 onInit() 中由参数（yaml/launch）读取并固定，避免每帧回调重复修改导致不一致
 
   // 记录 timedata（用于 calculate_results.py 的 total_time 计算）
   // 用仿真时间/ROS time（若 use_sim_time=true，则与 /clock 同步）
@@ -305,6 +285,18 @@ void SO3ControlNodelet::onInit(void)
   n.param("corrections/z", corrections_[0], 0.0);
   n.param("corrections/r", corrections_[1], 0.0);
   n.param("corrections/p", corrections_[2], 0.0);
+
+  // 平动 PD 增益（位置/速度），从 yaml/launch 读取
+  // 建议关系（近似临界阻尼）：kv ≈ 2*sqrt(kx*mass)
+  double kx_x, kx_y, kx_z, kv_x, kv_y, kv_z;
+  n.param("gains/pos/x", kx_x, 9.0);
+  n.param("gains/pos/y", kx_y, 9.0);
+  n.param("gains/pos/z", kx_z, 12.0);
+  n.param("gains/vel/x", kv_x, 6.0);
+  n.param("gains/vel/y", kv_y, 6.0);
+  n.param("gains/vel/z", kv_z, 7.5);
+  kx_ = Eigen::Vector3d(kx_x, kx_y, kx_z);
+  kv_ = Eigen::Vector3d(kv_x, kv_y, kv_z);
 
   // open timedata logs
   openTimedataLogs_(n);

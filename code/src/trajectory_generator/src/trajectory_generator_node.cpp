@@ -138,6 +138,9 @@ void rcvOdomCallback(const nav_msgs::Odometry::ConstPtr &odom)
 void execCallback(const ros::TimerEvent &e)
 {
   static int num = 0;
+  // 规划失败的简单退避，避免失败后紧密循环占满 CPU
+  static bool      plan_failed_recently = false;
+  static ros::Time last_plan_fail_t(0.0);
   num++;
   if (num == 100)
   {
@@ -165,8 +168,14 @@ void execCallback(const ros::TimerEvent &e)
     {
       if (!has_target)
         return;
-      else
-        changeState(GEN_NEW_TRAJ, "STATE");
+
+      // 若刚刚规划失败，稍作等待再重试（例如地图/点云尚未刷新）
+      if (plan_failed_recently &&
+          (ros::Time::now() - last_plan_fail_t).toSec() < 0.5)
+        return;
+
+      plan_failed_recently = false;
+      changeState(GEN_NEW_TRAJ, "STATE");
       break;
     }
 
@@ -179,8 +188,12 @@ void execCallback(const ros::TimerEvent &e)
       }
       else
       {
+        // 关键修复：不要因为一次规划失败就丢掉目标点，否则会出现“停在空旷处卡死”
+        // 这里进入 WAIT_TARGET 并保持 has_target=true，后续会带退避地自动重试规划。
+        plan_failed_recently = true;
+        last_plan_fail_t = ros::Time::now();
+        has_traj = false;
         changeState(WAIT_TARGET, "STATE");
-        has_target = false;
       }
       break;
     }
@@ -201,9 +214,25 @@ void execCallback(const ros::TimerEvent &e)
 
       if (t_cur > time_duration - 1e-2)
       {
-        has_target = false;
-        has_traj   = false;
-        changeState(WAIT_TARGET, "STATE");
+        // 关键修复：只有真正到达目标附近才清空 has_target。
+        // 若本段轨迹提前结束但距离目标仍远，则立即进入下一次规划，避免“卡死等待新目标”。
+        const double dist_to_goal = (target_pt - odom_pt).norm();
+        const double goal_tol = 0.35;  // 可根据需要改成参数
+
+        has_traj = false;
+        if (dist_to_goal < goal_tol)
+        {
+          has_target = false;
+          changeState(WAIT_TARGET, "STATE");
+        }
+        else
+        {
+          // 继续向同一个 target_pt 前进
+          has_target = true;
+          start_pt   = odom_pt;
+          start_vel  = odom_vel;
+          changeState(GEN_NEW_TRAJ, "STATE");
+        }
         return;
       }
       else if ((target_pt - odom_pt).norm() < no_replan_thresh)
@@ -433,26 +462,74 @@ void trajOptimization(Eigen::MatrixXd path)
     Eigen::Vector3d p1 = path.row(unsafe_segment).transpose();
     Eigen::Vector3d p2 = path.row(unsafe_segment + 1).transpose();
     Eigen::Vector3d mid_point = (p1 + p2) / 2.0;
-    
-    // 尝试找到一个安全的中间点
-    Eigen::Vector3i mid_idx = _astar_path_finder->coord2gridIndex(mid_point);
-    if (_astar_path_finder->is_occupy(mid_idx))
-    {
-      // 如果中间点被占用，尝试在周围找一个安全的点
-      bool found_safe = false;
-      for (int dz = 1; dz <= 3 && !found_safe; ++dz)
-      {
-        Eigen::Vector3d test_point = mid_point + Eigen::Vector3d(0, 0, dz * 0.3);
-        Eigen::Vector3i test_idx = _astar_path_finder->coord2gridIndex(test_point);
-        if (!_astar_path_finder->is_occupy(test_idx))
-        {
-          mid_point = test_point;
-          found_safe = true;
-        }
+
+    // 更强的中间点选择：同时检查 hard-clearance + 线段采样（降低“穿障/贴障”）
+    int hard_xy_cells = 1, hard_z_cells = 0;
+    ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
+    ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+
+    const double step = std::max(0.05, 0.5 * _resolution);
+
+    auto pointSafe = [&](const Eigen::Vector3d &p) -> bool {
+      const Eigen::Vector3i idx = _astar_path_finder->c2i(p);
+      if (_astar_path_finder->is_occupy(idx)) return false;
+      if (_astar_path_finder->isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return false;
+      return true;
+    };
+
+    auto segmentSafe = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) -> bool {
+      const double L = (b - a).norm();
+      const int N = std::max(1, (int)std::ceil(L / step));
+      for (int ii = 0; ii <= N; ++ii) {
+        const double t = (double)ii / (double)N;
+        const Eigen::Vector3d p = a + t * (b - a);
+        if (!pointSafe(p)) return false;
       }
-      if (!found_safe)
-      {
-        ROS_WARN("[trajOptimization] Cannot find safe middle point, using original.");
+      return true;
+    };
+
+    auto clearanceM = [&](const Eigen::Vector3d &p) -> double {
+      const Eigen::Vector3i idx = _astar_path_finder->c2i(p);
+      return _astar_path_finder->nearestObsDistM(idx, 6);
+    };
+
+    // 先用原 mid_point 试一次
+    bool mid_ok = pointSafe(mid_point) && segmentSafe(p1, mid_point) && segmentSafe(mid_point, p2);
+    if (!mid_ok) {
+      // 在 mid_point 周围做小范围搜索：优先“更大间距 + 更小偏移”
+      Eigen::Vector3d best = mid_point;
+      double bestScore = 1e100;
+      bool found = false;
+
+      for (int r = 1; r <= 4; ++r) {
+        for (int dx = -r; dx <= r; ++dx) {
+          for (int dy = -r; dy <= r; ++dy) {
+            for (int dz = -std::min(2, r); dz <= std::min(2, r); ++dz) {
+              Eigen::Vector3d cand = mid_point + Eigen::Vector3d(dx, dy, dz) * _resolution;
+              if (!pointSafe(cand)) continue;
+              if (!segmentSafe(p1, cand)) continue;
+              if (!segmentSafe(cand, p2)) continue;
+
+              const double clr = clearanceM(cand);
+              const double off2 = (double)(dx*dx + dy*dy) + 0.5 * (double)(dz*dz);
+              // score：偏移越小越好，间距越大越好
+              const double score = 1.0 * off2 - 6.0 * clr;
+              if (score < bestScore) {
+                bestScore = score;
+                best = cand;
+                found = true;
+              }
+            }
+          }
+        }
+        if (found) break;
+      }
+
+      if (found) {
+        mid_point = best;
+        mid_ok = true;
+      } else {
+        ROS_WARN("[trajOptimization] Cannot find safe mid-point (hard-clearance). Keep original mid.");
       }
     }
     

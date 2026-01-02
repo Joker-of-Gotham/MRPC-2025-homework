@@ -655,44 +655,14 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
     return d / n;
   };
 
-  // safe fallback: find a nearby “retreat” point with maximum clearance
-  auto pickRetreat = [&](const Vector3i& seed) -> Vector3i {
-    Vector3i best = seed;
-    double bestClr = nearestObsDistM(seed, soft_scan_cells);
-
-    for (int r = 1; r <= 6; ++r) {
-      for (int dx = -r; dx <= r; ++dx)
-        for (int dy = -r; dy <= r; ++dy)
-          for (int dz = -std::min(2, r); dz <= std::min(2, r); ++dz) {
-            Vector3i q = seed + Vector3i(dx, dy, dz);
-            if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
-                q(1) < 0 || q(1) >= GRID_Y_SIZE ||
-                q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-            if (isOccupied(q) || isTooCloseHard(q, hard_xy_cells, hard_z_cells)) continue;
-
-            // prefer small dz
-            const double dzm = std::fabs(gridIndex2coord(q)(2) - gridIndex2coord(seed)(2));
-            if (dzm > 0.8) continue;
-
-            const double clr = nearestObsDistM(q, soft_scan_cells);
-            if (clr > bestClr + 1e-6) {
-              // require segment safety
-              if (segmentSafe(gridIndex2coord(seed), gridIndex2coord(q))) {
-                best = q;
-                bestClr = clr;
-              }
-            }
-          }
-    }
-    return best;
-  };
+  // NOTE: 原先的 retreat 逻辑会导致无人机“往回飞/停在空旷处卡死”，已移除。
 
   while (!Openset.empty()) {
     // time budget - 延长搜索时间，确保尽可能找到完整路径
     const double elapsed = (ros::Time::now() - t0).toSec();
     if (elapsed > max_search_time * 2.0) {
       // 只有在搜索时间非常长时才中断
-      // 优先使用 bestPtr（最接近目标的点），而不是 retreat
+      // 优先使用 bestPtr（最接近目标的点）作为“部分路径终点”
       const double clr = nearestObsDistM(bestPtr->index, soft_scan_cells);
       
       if (bestPtr->index == goalIdx) {
@@ -701,13 +671,16 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
         return true;
       }
 
-      // 关键修复：即使没有完全到达目标，也要向目标方向前进
-      // 不要使用 retreat 机制，这会导致无人机往回飞
+      // 若毫无进展（bestPtr 仍为 start），直接返回失败
+      if (bestPtr == startPtr) {
+        ROS_WARN("[A*] time budget hit but no progress (clr=%.2f).", clr);
+        return false;
+      }
+
+      // 返回“部分路径”（到 bestPtr），由上层状态机继续重规划直至到达目标
       terminatePtr = bestPtr;
-      // 重要：设置 g_reached_goal = true，确保终点被保留
-      // 虽然没有完全到达，但路径应该朝向目标
-      g_reached_goal = true;  
-      ROS_WARN("[A*] time budget hit. Using best-so-far toward goal (clr=%.2f, h=%.2f).", clr, best_h);
+      g_reached_goal = false;
+      ROS_WARN("[A*] time budget hit. Return partial path to best-so-far (clr=%.2f, h=%.2f).", clr, best_h);
       return true;
     }
 
@@ -795,11 +768,10 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
   }
 
   // openset exhausted: 使用 bestPtr，确保向目标方向前进
-  // 不使用 retreat，避免无人机往回飞
+  // 不使用 retreat，避免无人机往回飞；返回部分路径由上层继续重规划
   if (bestPtr != startPtr) {
     terminatePtr = bestPtr;
-    // 即使没有完全到达目标，也标记为 true 以保留终点方向
-    g_reached_goal = true;
+    g_reached_goal = false;
     ROS_WARN("[A*] openset exhausted. Using best-so-far toward goal (h=%.2f).", best_h);
     return true;
   }
@@ -828,16 +800,13 @@ vector<Vector3d> Astarpath::getPath() {
   // anchor endpoints - 关键修复：始终保留起点和目标点
   if (g_have_cont && !path.empty()) {
     path.front() = g_start_cont;
-    // 始终将终点设置为目标点，确保轨迹朝向目标
-    // 即使 A* 没有完全到达目标，也要保持目标方向
-    path.back() = g_goal_cont;
+    // 仅当真正到达 goalIdx 时才用连续目标点覆盖末端
+    if (g_reached_goal) path.back() = g_goal_cont;
   }
-  
-  ROS_INFO("[getPath] path size = %d, start=(%.2f,%.2f,%.2f), goal=(%.2f,%.2f,%.2f)",
-           (int)path.size(), 
-           path.empty() ? 0 : path.front()(0), path.empty() ? 0 : path.front()(1), path.empty() ? 0 : path.front()(2),
-           path.empty() ? 0 : path.back()(0), path.empty() ? 0 : path.back()(1), path.empty() ? 0 : path.back()(2));
-           
+
+  ROS_INFO_THROTTLE(1.0, "[getPath] size=%d reached_goal=%d",
+                    (int)path.size(), (int)g_reached_goal);
+
   return path;
 }
 
@@ -925,19 +894,18 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   }
   if (clean.size() < 2) return clean;
 
-  // anchor endpoints - 始终保留起点和目标点
+  // anchor endpoints
+  // - 起点：用连续起点坐标（避免“贴格子中心”带来的微小抖动）
+  // - 终点：只有 A* 真正到达 goalIdx 时才用连续目标点覆盖，否则保持部分路径终点
   if (g_have_cont) {
     clean.front() = sanitizePoint(g_start_cont);
-    // 关键：始终保留目标点，确保轨迹朝向目标
-    clean.back() = sanitizePoint(g_goal_cont);
+    if (g_reached_goal) clean.back() = sanitizePoint(g_goal_cont);
+    else clean.back() = sanitizePoint(clean.back());
   } else {
     clean.front() = sanitizePoint(clean.front());
     clean.back()  = sanitizePoint(clean.back());
   }
   
-  // 保存原始目标点用于最后确保终点正确
-  const Vector3d original_goal = clean.back();
-
   // 2) greedy LoS prune (strict)
   std::vector<Vector3d> pruned;
   pruned.reserve(clean.size());
@@ -1178,22 +1146,9 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
     if ((out[ii] - final_out.back()).norm() > 1e-4) final_out.push_back(out[ii]);
   }
 
-  // 关键修复：确保终点始终是目标点
-  // 如果最后一个点不是目标点，添加目标点
-  if (g_have_cont && !final_out.empty()) {
-    Vector3d goal = sanitizePoint(g_goal_cont);
-    if ((final_out.back() - goal).norm() > 0.1) {
-      // 如果到目标点的路径是安全的，直接添加
-      if (segmentSafe(final_out.back(), goal)) {
-        final_out.push_back(goal);
-      } else {
-        // 否则保持最后一个点，但警告
-        ROS_WARN("[pathSimplify] Cannot safely reach goal, keeping last safe point.");
-      }
-    } else {
-      // 确保最后一个点精确是目标点
-      final_out.back() = goal;
-    }
+  // 若确实到达了 goalIdx，则用连续目标点覆盖末端（更精确）
+  if (g_have_cont && g_reached_goal && !final_out.empty()) {
+    final_out.back() = sanitizePoint(g_goal_cont);
   }
 
   ROS_INFO("[pathSimplify] in=%d clean=%d pruned=%d fillet=%d out=%d",
@@ -1244,8 +1199,9 @@ int Astarpath::safeCheck(MatrixXd polyCoeff, VectorXd time) {
   ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
   ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
 
-  // finer sampling
-  const double delta_t = std::max(std::min(resolution * 0.5, 0.10), 0.03);
+  // finer sampling：更密一些以降低“穿过细障碍但未被采样到”的概率
+  // 经验值：让采样步长对应的位移不超过 ~0.1m（在 2~3m/s 量级下）
+  const double delta_t = std::max(std::min(resolution * 0.25, 0.06), 0.02);
 
   auto insideMap = [&](const Vector3d& p) -> bool {
     return (p(0) >= gl_xl && p(0) < gl_xu &&
@@ -1264,7 +1220,7 @@ int Astarpath::safeCheck(MatrixXd polyCoeff, VectorXd time) {
   double t = delta_t;
   Vector3d advancePos;
   for (int i = 0; i < polyCoeff.rows(); i++) {
-    while (t < time(i)) {
+    while (t <= time(i) + 1e-9) {
       advancePos = getPosPoly(polyCoeff, i, t);
       if (!pointSafe(advancePos)) {
         unsafe_segment = i;
