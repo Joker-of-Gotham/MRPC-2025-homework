@@ -27,8 +27,9 @@ class Astarpath
 		MappingNodePtr terminatePtr;
 		std::multimap<double, MappingNodePtr> Openset;
 
-		// 缓存的参数（在 AstarSearch 开头初始化一次，避免频繁调用 ros::param::param）
-		int hard_xy_cells_ = 2;
+		// 性能关键：A* 内层扩展（AstarGetSucc）绝不能频繁访问参数服务器（ros::param）。
+		// 这些参数在每次 AstarSearch 开头缓存一次，供 AstarGetSucc/Theta* 直接读取。
+		int hard_xy_cells_ = 1;
 		int hard_z_cells_  = 0;
 
 		double getHeu(MappingNodePtr node1, MappingNodePtr node2);

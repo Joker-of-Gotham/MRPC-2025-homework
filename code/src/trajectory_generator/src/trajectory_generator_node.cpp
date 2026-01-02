@@ -53,6 +53,9 @@ ros::Publisher _traj_vis_pub, _traj_before_vis_pub, _traj_pub, _path_vis_pub,
 ros::Publisher _pos_cmd_pub;  // *** 新增：位置指令发布器
 ros::Publisher _rmse_pub;     // *** 新增：实时 RMSE 发布器
 
+// 默认不直接发布 /position_cmd（避免与 traj_server 同 topic 双发布引入抖动/误差）
+static bool g_direct_position_cmd = false;
+
 // for planning
 Vector3d odom_pt, odom_vel, start_pt, target_pt, start_vel;
 int _poly_num1D;
@@ -93,8 +96,13 @@ static bool   g_auto_shutdown_on_goal = true;
 static double g_shutdown_delay_s      = 0.5;
 static bool   g_shutdown_scheduled    = false;
 static ros::NodeHandle *g_nh_ptr      = nullptr;
-static ros::Timer g_shutdown_timer;
-void shutdownCb(const ros::TimerEvent &e);
+// NOTE:
+// 直接在回调里 ros::(request)Shutdown 在某些环境会触发 boost::lock_error（mutex 已销毁/非法）。
+// 这里改为“设置退出标志”，由 main() 的循环安全退出（return 0），避免异常终止。
+static bool g_exit_requested = false;
+static ros::WallTime g_exit_deadline_wall;
+static std::string g_exit_reason;
+static void requestProcessExit(const std::string& reason);
 
 // declare
 void changeState(STATE new_state, string pos_call);
@@ -138,6 +146,27 @@ void printState()
   string state_str[6] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ",
                          "EXEC_TRAJ", "REPLAN_TRAJ", "EMER_STOP"};
   cout << "[Clock]: state: " + state_str[int(exec_state)] << endl;
+}
+
+static void requestProcessExit(const std::string& reason)
+{
+  if (g_exit_requested) return;
+  g_exit_requested = true;
+  g_exit_reason = reason;
+  const double delay = std::max(0.0, g_shutdown_delay_s);
+  g_exit_deadline_wall = ros::WallTime::now() + ros::WallDuration(delay);
+
+  // 到点/达标后不再继续规划，先把飞行器刹停在当前位置
+  abortTrajServer();
+  has_traj = false;
+  has_target = false;
+  exec_state = WAIT_TARGET;
+
+  // 停掉定时器，避免退出前还在高频跑逻辑占 CPU
+  try { _exec_timer.stop(); } catch (...) {}
+  try { _safety_timer_.stop(); } catch (...) {}
+
+  ROS_WARN("[node] exit requested (%s), will exit in %.2fs.", reason.c_str(), delay);
 }
 
 void rcvOdomCallback(const nav_msgs::Odometry::ConstPtr &odom)
@@ -228,8 +257,9 @@ void execCallback(const ros::TimerEvent &e)
       double    t_replan = ros::Duration(1, 0).toSec();
       t_cur              = min(time_duration, t_cur);
 
-      // *** 在这里实时发送 PositionCommand
-      publishPositionCommand(t_cur);
+      // *** 可选：直接发布 /position_cmd（默认关闭，避免与 traj_server 双发布）
+      if (g_direct_position_cmd)
+        publishPositionCommand(t_cur);
       // *** 实时 RMSE（用于观察误差收敛）
       publishRmse(t_cur);
 
@@ -240,16 +270,11 @@ void execCallback(const ros::TimerEvent &e)
       ros::param::param("~rmse_hold_time", rmse_hold, 0.40);
       if (rmseOkAndStable(rmse_stop, rmse_hold))
       {
-        abortTrajServer();
         changeState(WAIT_TARGET, "RMSE_OK");
         if (g_auto_shutdown_on_goal && !g_shutdown_scheduled)
         {
           g_shutdown_scheduled = true;
-          if (g_nh_ptr)
-            g_shutdown_timer = g_nh_ptr->createTimer(ros::Duration(std::max(0.0, g_shutdown_delay_s)),
-                                                    shutdownCb, true);
-          else
-            std::exit(0);
+          requestProcessExit("RMSE_OK");
         }
         return;
       }
@@ -308,11 +333,7 @@ void execCallback(const ros::TimerEvent &e)
           if (g_auto_shutdown_on_goal && !g_shutdown_scheduled)
           {
             g_shutdown_scheduled = true;
-            if (g_nh_ptr)
-              g_shutdown_timer = g_nh_ptr->createTimer(ros::Duration(std::max(0.0, g_shutdown_delay_s)),
-                                                      shutdownCb, true);
-            else
-              ros::shutdown();
+            requestProcessExit("GOAL_REACHED");
           }
           return;
         }
@@ -338,11 +359,7 @@ void execCallback(const ros::TimerEvent &e)
           if (g_auto_shutdown_on_goal && !g_shutdown_scheduled)
           {
             g_shutdown_scheduled = true;
-            if (g_nh_ptr)
-              g_shutdown_timer = g_nh_ptr->createTimer(ros::Duration(std::max(0.0, g_shutdown_delay_s)),
-                                                      shutdownCb, true);
-            else
-              ros::shutdown();
+            requestProcessExit("GOAL_REACHED_TEND");
           }
         }
         else
@@ -389,8 +406,9 @@ void execCallback(const ros::TimerEvent &e)
       start_pt  = odom_pt;
       start_vel = odom_vel;
 
-      // *** REPLAN 时也先发一次当前 PositionCommand，防止控制器断指令
-      publishPositionCommand(t_cur);
+      // *** 可选：REPLAN 时也先发一次当前 /position_cmd
+      if (g_direct_position_cmd)
+        publishPositionCommand(t_cur);
 
       bool success = trajGeneration();
       if (success)
@@ -603,13 +621,6 @@ void abortTrajServer()
   msg.action          = quadrotor_msgs::PolynomialTrajectory::ACTION_ABORT;
   msg.trajectory_id   = 0;
   _traj_pub.publish(msg);
-}
-
-void shutdownCb(const ros::TimerEvent & /*e*/)
-{
-  ROS_WARN("[node] goal reached, auto shutdown.");
-  // 直接使用 std::exit(0) 是最安全的方式，避免所有回调队列和锁问题
-  std::exit(0);
 }
 
 bool trajOptimization(const Eigen::MatrixXd &path_in, const Eigen::MatrixXd &path_raw_in)
@@ -1149,6 +1160,7 @@ int main(int argc, char **argv)
   g_nh_ptr = &nh;
   nh.param("auto_shutdown_on_goal", g_auto_shutdown_on_goal, true);
   nh.param("shutdown_delay", g_shutdown_delay_s, 0.5);
+  nh.param("direct_position_cmd", g_direct_position_cmd, false);
 
   nh.param("planning/vel", _Vel, 1.0);
   nh.param("planning/acc", _Acc, 1.0);
@@ -1175,7 +1187,11 @@ int main(int argc, char **argv)
   clear_file.close();
 
   _exec_timer    = nh.createTimer(ros::Duration(0.01), execCallback);
-  _safety_timer_ = nh.createTimer(ros::Duration(0.05), issafe);
+  // 碰撞记录频率：过低会在高速穿过细障碍时“漏检”
+  double issafe_dt = 0.01; // 100Hz
+  nh.param("issafe_dt", issafe_dt, 0.01);
+  if (issafe_dt < 0.002) issafe_dt = 0.002; // 防止过高频率占满 CPU
+  _safety_timer_ = nh.createTimer(ros::Duration(issafe_dt), issafe);
 
   _odom_sub = nh.subscribe("odom", 10, rcvOdomCallback);
   _map_sub  = nh.subscribe("local_pointcloud", 1, rcvPointCloudCallBack);
@@ -1194,9 +1210,12 @@ int main(int argc, char **argv)
   _astar_path_vis_pub =
       nh.advertise<visualization_msgs::Marker>("vis_path_astar", 1);
 
-  // *** 关键：直接给 so3_control 的位置指令
-  _pos_cmd_pub =
-      nh.advertise<quadrotor_msgs::PositionCommand>("/position_cmd", 10);
+  // 可选：直接给 so3_control 的位置指令（默认关闭，避免与 traj_server 双发布）
+  if (g_direct_position_cmd)
+  {
+    _pos_cmd_pub =
+        nh.advertise<quadrotor_msgs::PositionCommand>("/position_cmd", 10);
+  }
 
   // *** 实时 RMSE 发布（便于调参观察）
   _rmse_pub = nh.advertise<std_msgs::Float64>("rmse", 10);
@@ -1218,6 +1237,8 @@ int main(int argc, char **argv)
   while (status)
   {
     ros::spinOnce();
+    if (g_exit_requested && ros::WallTime::now() >= g_exit_deadline_wall)
+      break;
     status = ros::ok();
     rate.sleep();
   }

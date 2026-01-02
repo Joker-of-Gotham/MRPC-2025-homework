@@ -329,39 +329,47 @@ double Astarpath::softClearancePenalty(const Vector3i &idx,
 }
 
 // ============================================================
-// Fast grid LoS for Theta*
-// Only checks occupancy (NOT hard-clearance) for speed.
-// Endpoints already passed hard-clearance in AstarGetSucc.
+// Fast grid LoS (Bresenham-like) for Theta*
+// Checks occupancy + hard-clearance along the discrete line
 // ============================================================
 bool Astarpath::lineOfSight(const Eigen::Vector3i &a,
                             const Eigen::Vector3i &b,
-                            int /*hard_xy_cells*/,
-                            int /*hard_z_cells*/) const
+                            int hard_xy_cells,
+                            int hard_z_cells) const
 {
-  // 3D Bresenham-like traversal (integer-only, very fast)
-  int dx = b(0) - a(0);
-  int dy = b(1) - a(1);
-  int dz = b(2) - a(2);
-  
-  int sx = (dx > 0) ? 1 : (dx < 0) ? -1 : 0;
-  int sy = (dy > 0) ? 1 : (dy < 0) ? -1 : 0;
-  int sz = (dz > 0) ? 1 : (dz < 0) ? -1 : 0;
-  
-  dx = std::abs(dx);
-  dy = std::abs(dy);
-  dz = std::abs(dz);
-  
-  int maxD = std::max({dx, dy, dz});
-  if (maxD == 0) return true;
-  
+  // 3D integer traversal (Bresenham-like), very fast and no floating conversions.
   int x = a(0), y = a(1), z = a(2);
+  const int ex = b(0), ey = b(1), ez = b(2);
+
+  int dx = std::abs(ex - x);
+  int dy = std::abs(ey - y);
+  int dz = std::abs(ez - z);
+
+  const int sx = (ex > x) ? 1 : (ex < x) ? -1 : 0;
+  const int sy = (ey > y) ? 1 : (ey < y) ? -1 : 0;
+  const int sz = (ez > z) ? 1 : (ez < z) ? -1 : 0;
+
+  const int maxD = std::max({dx, dy, dz});
+  if (maxD == 0)
+  {
+    const Eigen::Vector3i idx(x, y, z);
+    if (isOccupied(idx)) return false;
+    if (isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return false;
+    return true;
+  }
+
   int errX = 2 * dx - maxD;
   int errY = 2 * dy - maxD;
   int errZ = 2 * dz - maxD;
-  
-  for (int i = 0; i <= maxD; ++i) {
-    if (isOccupied(x, y, z)) return false;
-    
+
+  for (int i = 0; i <= maxD; ++i)
+  {
+    const Eigen::Vector3i idx(x, y, z);
+    if (isOccupied(idx)) return false;
+    if (isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return false;
+
+    if (x == ex && y == ey && z == ez) break;
+
     if (errX > 0) { x += sx; errX -= 2 * maxD; }
     if (errY > 0) { y += sy; errY -= 2 * maxD; }
     if (errZ > 0) { z += sz; errZ -= 2 * maxD; }
@@ -373,7 +381,7 @@ bool Astarpath::lineOfSight(const Eigen::Vector3i &a,
 }
 
 // ============================================================
-// Successors (26-neighborhood + minimal checks for SPEED)
+// Successors (26-neighborhood + NO corner cutting + hard clearance)
 // ============================================================
 
 inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
@@ -383,12 +391,18 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
   neighborPtrSets.clear();
   edgeCostSets.clear();
 
-  // 使用缓存的参数（在 AstarSearch 开头初始化），避免频繁调用 ros::param::param
-  // hard_xy_cells_ 和 hard_z_cells_ 是类成员变量
+  // hard-clearance params：从 AstarSearch 缓存读取（禁止在内层循环访问参数服务器）
+  const int hard_xy_cells = hard_xy_cells_;
+  const int hard_z_cells  = hard_z_cells_;
 
   const int x = currentPtr->index(0);
   const int y = currentPtr->index(1);
   const int z = currentPtr->index(2);
+
+  // “逃逸模式”：若当前点处于 hard-clearance 区域内，允许扩展一些同样贴近障碍的点，
+  // 但要求它们能显著增大与障碍的距离（逐步爬出），否则会出现 openset exhausted/no progress 卡死。
+  const bool cur_too_close = isTooCloseHard(currentPtr->index, hard_xy_cells, hard_z_cells);
+  const double cur_clr = nearestObsDistM(currentPtr->index, 6);
 
   for (int dx = -1; dx <= 1; ++dx) {
     for (int dy = -1; dy <= 1; ++dy) {
@@ -402,12 +416,46 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
 
         Vector3i nidx(nx, ny, nz);
         if (isOccupied(nidx)) continue;
+        // allow goal cell even if it violates hard-clearance (but never if occupied)
+        if (nidx != goalIdx && isTooCloseHard(nidx, hard_xy_cells, hard_z_cells)) {
+          // escape: allow only if it increases clearance vs current
+          if (!(cur_too_close && (nearestObsDistM(nidx, 6) > cur_clr + 1e-3))) continue;
+        }
 
-        // hard-clearance check (fast inline)
-        // 允许 goal 点即使在 clearance 内也能被扩展
-        if (nidx != goalIdx && isTooCloseHard(nidx, hard_xy_cells_, hard_z_cells_)) continue;
+        // no corner cutting (also with clearance)
+        Vector3i ax(x + dx, y, z);
+        Vector3i bx(x, y + dy, z);
+        Vector3i cx(x, y, z + dz);
+
+        // 在逃逸模式下，角点/边的 clearance 检查会把所有可行邻居剪没；
+        // 因此这里对“占据”仍严格禁止，但 clearance 只在非逃逸模式下强制。
+        if (dx != 0 && isOccupied(ax)) continue;
+        if (dy != 0 && isOccupied(bx)) continue;
+        if (dz != 0 && isOccupied(cx)) continue;
+        if (!cur_too_close) {
+          if (dx != 0 && isTooCloseHard(ax, hard_xy_cells, hard_z_cells)) continue;
+          if (dy != 0 && isTooCloseHard(bx, hard_xy_cells, hard_z_cells)) continue;
+          if (dz != 0 && isTooCloseHard(cx, hard_xy_cells, hard_z_cells)) continue;
+        }
+
+        if (dx != 0 && dy != 0) {
+          Vector3i cxy(x + dx, y + dy, z);
+          if (isOccupied(cxy)) continue;
+          if (!cur_too_close && isTooCloseHard(cxy, hard_xy_cells, hard_z_cells)) continue;
+        }
+        if (dx != 0 && dz != 0) {
+          Vector3i cxz(x + dx, y, z + dz);
+          if (isOccupied(cxz)) continue;
+          if (!cur_too_close && isTooCloseHard(cxz, hard_xy_cells, hard_z_cells)) continue;
+        }
+        if (dy != 0 && dz != 0) {
+          Vector3i cyz(x, y + dy, z + dz);
+          if (isOccupied(cyz)) continue;
+          if (!cur_too_close && isTooCloseHard(cyz, hard_xy_cells, hard_z_cells)) continue;
+        }
 
         neighborPtrSets.push_back(Map_Node[nx][ny][nz]);
+
         double base = std::sqrt(double(dx * dx + dy * dy + dz * dz));
         if (dz != 0) base *= kZMovePenalty;
         edgeCostSets.push_back(base);
@@ -485,10 +533,22 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
     ros::param::param("~astar_use_theta_star", use_theta_star, true);
 
     inited = true;
+  } else {
+    // allow runtime tuning
+    ros::param::get("~astar_max_search_time", max_search_time);
+    ros::param::get("~astar_w", w_astar);
+    ros::param::get("~astar_turn_penalty_w", turn_w);
+    ros::param::get("~astar_zturn_penalty_w", zturn_w);
+    ros::param::get("~astar_zdev_penalty_w", zdev_w);
+    ros::param::get("~astar_soft_clearance_range_m", soft_range_m);
+    ros::param::get("~astar_soft_clearance_scan_cells", soft_scan_cells);
+    ros::param::get("~astar_soft_clearance_weight", soft_w);
+    ros::param::get("~astar_hard_clearance_xy", hard_xy_cells);
+    ros::param::get("~astar_hard_clearance_z", hard_z_cells);
+    ros::param::get("~astar_use_theta_star", use_theta_star);
   }
-  // 注意：去掉 runtime tuning，只在初始化时读取一次参数，大幅提升速度
-  
-  // 缓存到成员变量，供 AstarGetSucc 使用
+
+  // cache for inner-loop successor expansion (AstarGetSucc)
   hard_xy_cells_ = hard_xy_cells;
   hard_z_cells_  = hard_z_cells;
 
@@ -788,8 +848,9 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
         const Vector3d ncoord = gridIndex2coord(neighborPtr->index);
         MappingNodePtr p = currentPtr->Father;
         if (lineOfSight(p->index, neighborPtr->index, hard_xy_cells, hard_z_cells)) {
-          // 简化：只计算欧氏距离 + 高度偏差，去掉耗时的 softClearancePenalty
           double g_theta = p->g_score + (ncoord - p->coord).norm();
+          // keep penalties roughly consistent (endpoint-based)
+          g_theta += soft_w * softClearancePenalty(neighborPtr->index, soft_range_m, soft_scan_cells);
           g_theta += zdev_w * std::fabs(ncoord(2) - nominal_z);
           if (g_theta + 1e-6 < best_g) {
             best_g = g_theta;
@@ -1287,9 +1348,18 @@ int Astarpath::safeCheck(MatrixXd polyCoeff, VectorXd time) {
   ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
   ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
 
-  // finer sampling：更密一些以降低“穿过细障碍但未被采样到”的概率
-  // 经验值：让采样步长对应的位移不超过 ~0.1m（在 2~3m/s 量级下）
-  const double delta_t = std::max(std::min(resolution * 0.25, 0.06), 0.02);
+  // finer sampling：更密一些以降低“高速穿过细障碍但未被采样到”的概率
+  const double dt_default = std::max(std::min(resolution * 0.20, 0.04), 0.01);
+  double delta_t = dt_default;
+  ros::param::param("~safecheck_dt", delta_t, dt_default);
+  if (delta_t < 0.005) delta_t = 0.005;
+
+  // 额外 clearance（与执行/跟踪误差相关）：0=关闭
+  double min_clearance_m = 0.0;
+  int    clr_scan_cells  = 8;
+  ros::param::param("~safecheck_min_clearance_m", min_clearance_m, 0.0);
+  ros::param::param("~safecheck_clearance_scan_cells", clr_scan_cells, 8);
+  if (clr_scan_cells < 1) clr_scan_cells = 1;
 
   auto insideMap = [&](const Vector3d& p) -> bool {
     return (p(0) >= gl_xl && p(0) < gl_xu &&
@@ -1302,6 +1372,11 @@ int Astarpath::safeCheck(MatrixXd polyCoeff, VectorXd time) {
     Vector3i idx = coord2gridIndex(p);
     if (isOccupied(idx)) return false;
     if (isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return false;
+    if (min_clearance_m > 1e-6)
+    {
+      const double clr = nearestObsDistM(idx, clr_scan_cells);
+      if (clr < min_clearance_m) return false;
+    }
     return true;
   };
 

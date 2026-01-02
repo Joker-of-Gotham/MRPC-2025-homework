@@ -58,9 +58,9 @@
     
     <!-- A* 搜索参数 -->
     <param name="astar_max_search_time"     value="0.35"/>
-    <!-- hard-clearance：增加到 2 格（0.4m@0.2m 分辨率），让规划路径远离障碍物，
-         避免高速飞行时因轨迹跟踪误差导致穿越障碍 -->
-    <param name="astar_hard_clearance_xy"   value="2"/>
+    <!-- hard-clearance：回到 1 格（0.2m@0.2m 分辨率），让“可通过的缝”不过度被封死；
+         具体安全由 soft-clearance + 前瞻碰撞与必要时制动保证 -->
+    <param name="astar_hard_clearance_xy"   value="1"/>
     <param name="astar_hard_clearance_z"    value="0"/>
     <param name="astar_soft_clearance_range_m" value="0.60"/>
     <!-- soft-clearance：偏好大间距通道，但不至于把可通过缝全部判掉 -->
@@ -73,10 +73,12 @@
 
     <!-- 轨迹前瞻碰撞预测（障碍进入视野后能立刻触发重规划） -->
     <param name="collision_check_horizon" value="2.5"/>
-    <param name="collision_check_dt"      value="0.05"/>
+    <!-- dt 过大会在高速穿过细障碍时漏检，建议 <=0.02 -->
+    <param name="collision_check_dt"      value="0.02"/>
     <!-- 前瞻碰撞：默认启用 clearance 阈值 + 连续命中抑制噪声 -->
     <param name="collision_check_use_clearance" value="true"/>
-    <param name="collision_check_min_clearance_m" value="0.18"/>
+    <!-- 适当提高 clearance，给跟踪误差留余量，减少“擦边高速穿障” -->
+    <param name="collision_check_min_clearance_m" value="0.22"/>
     <param name="collision_check_min_clearance_kv" value="0.03"/>
     <param name="collision_check_consecutive_hits" value="3"/>
     <!-- 若预计碰撞时间 < stop_time，则先 ABORT 立即悬停制动 -->
@@ -90,6 +92,12 @@
     <!-- RMSE 达标（<=0.015）即可停止 -->
     <param name="rmse_stop" value="0.015"/>
     <param name="rmse_hold_time" value="0.40"/>
+    <!-- 碰撞记录（issafe）频率：提高到 100Hz，避免高速漏检 -->
+    <param name="issafe_dt" value="0.01"/>
+    <!-- 轨迹安全检查采样：更细一点，降低“多项式抄近路穿障” -->
+    <param name="safecheck_dt" value="0.01"/>
+    <!-- 轨迹安全检查 clearance：给跟踪误差留余量（0=关闭） -->
+    <param name="safecheck_min_clearance_m" value="0.22"/>
     <!-- 到达目标后自动退出（required=true 会触发 roslaunch 退出，便于统计 total_time） -->
     <param name="auto_shutdown_on_goal" value="true"/>
     <param name="shutdown_delay" value="0.5"/>

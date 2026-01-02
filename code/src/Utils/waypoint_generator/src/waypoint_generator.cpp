@@ -170,9 +170,12 @@ void goal_callback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
     } else if (waypoint_type == string("series")) {
         load_waypoints(n, trigged_time);
     } else if (waypoint_type == string("manual-lonely-waypoint")) {
-        if (msg->pose.position.z >= 0) {
+        // RViz 3D Nav Goal 有时会出现 z=-0.000 的数值误差，导致这里被误判为 invalid。
+        // 允许一个很小的负 epsilon，并把最终 z clamp 到 0。
+        if (msg->pose.position.z >= -1e-3) {
             // if height >= 0, it's a valid goal;
             geometry_msgs::PoseStamped pt = *msg;
+            if (pt.pose.position.z < 0) pt.pose.position.z = 0;
             waypoints.poses.clear();
             waypoints.poses.push_back(pt);
             publish_waypoints_vis();
