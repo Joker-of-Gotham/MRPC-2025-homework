@@ -67,6 +67,8 @@
     <param name="astar_soft_clearance_weight"  value="0.70"/>
     <!-- any-angle Theta*：减少不必要拐弯和中间点，提升通过缝隙能力 -->
     <param name="astar_use_theta_star" value="true"/>
+    <!-- 距离场最大传播步数（cells）：用于快速 clearance 查询，过小会导致误判“远处”距离 -->
+    <param name="distance_field_max_cells" value="20"/>
     <!-- set_barrier 的点云栅格膨胀：设太大容易把可通过的缝堵死 -->
     <param name="astar_inflation_xy_base" value="0.0"/>
     <param name="astar_inflation_z_base"  value="0.0"/>
@@ -98,6 +100,13 @@
     <param name="safecheck_dt" value="0.01"/>
     <!-- 轨迹安全检查 clearance：给跟踪误差留余量（0=关闭） -->
     <param name="safecheck_min_clearance_m" value="0.22"/>
+
+    <!-- 可视化采样（过密会导致 RViz/CPU 卡顿） -->
+    <param name="vis_traj_dt" value="0.05"/>
+
+    <!-- 默认关闭周期性重规划（主要依赖碰撞前瞻触发），避免反复 A*+QP 导致卡顿 -->
+    <param name="enable_periodic_replan" value="false"/>
+    <param name="periodic_replan_interval" value="3.0"/>
     <!-- 到达目标后自动退出（required=true 会触发 roslaunch 退出，便于统计 total_time） -->
     <param name="auto_shutdown_on_goal" value="true"/>
     <param name="shutdown_delay" value="0.5"/>

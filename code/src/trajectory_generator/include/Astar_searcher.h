@@ -2,6 +2,8 @@
 #define _ASTART_SEARCHER_H
 
 #include <iostream>
+#include <vector>
+#include <cstdint>
 #include <ros/ros.h>
 #include <ros/console.h>
 #include <Eigen/Eigen>
@@ -31,6 +33,16 @@ class Astarpath
 		// 这些参数在每次 AstarSearch 开头缓存一次，供 AstarGetSucc/Theta* 直接读取。
 		int hard_xy_cells_ = 1;
 		int hard_z_cells_  = 0;
+
+		// 仅重置“本次搜索用到”的节点，避免每次 O(map_size) 全图 reset 导致卡顿
+		std::vector<MappingNodePtr> used_nodes_;
+
+		// 近障碍距离场（Chessboard/L∞，保守下界）：用于快速 clearance 查询，替代大量邻域暴力扫描
+		// dist_chess_[addr] = 到最近占据格的步数（26邻域每步=1），并 cap 到 dist_max_cells_+1
+		std::vector<uint16_t> dist_chess_;
+		int dist_max_cells_ = 0;
+		bool dist_inited_ = false;
+		std::vector<int> pending_obs_addr_;  // 新增占据格（monotonic add）用于增量更新
 
 		double getHeu(MappingNodePtr node1, MappingNodePtr node2);
 		void AstarGetSucc(MappingNodePtr currentPtr, std::vector<MappingNodePtr> & neighborPtrSets, std::vector<double> & edgeCostSets);		
@@ -70,6 +82,9 @@ class Astarpath
 		double softClearancePenalty(const Eigen::Vector3i &idx, double soft_range_m, int soft_scan_cells) const;
 		bool   lineOfSight(const Eigen::Vector3i &a, const Eigen::Vector3i &b, int hard_xy_cells, int hard_z_cells) const;
 		bool   findNearestFree(const Eigen::Vector3i &seed, Eigen::Vector3i &out_free);
+
+		// 更新/增量更新距离场（用于 soft-clearance / collision check）
+		void ensureDistanceField(int max_cells);
 
 };
 

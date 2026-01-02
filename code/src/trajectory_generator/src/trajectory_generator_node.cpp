@@ -254,7 +254,6 @@ void execCallback(const ros::TimerEvent &e)
       time_Count++;
       ros::Time time_now = ros::Time::now();
       double    t_cur    = (time_now - time_traj_start).toSec();
-      double    t_replan = ros::Duration(1, 0).toSec();
       t_cur              = min(time_duration, t_cur);
 
       // *** 可选：直接发布 /position_cmd（默认关闭，避免与 traj_server 双发布）
@@ -263,11 +262,30 @@ void execCallback(const ros::TimerEvent &e)
       // *** 实时 RMSE（用于观察误差收敛）
       publishRmse(t_cur);
 
+      // 参数缓存：避免 100Hz execCallback 频繁访问参数服务器导致卡顿/信息更新滞后
+      static ros::Time last_param_update(0.0);
+      static double rmse_stop = 0.015;
+      static double rmse_hold = 0.40;
+      static double collision_stop_time = 0.5;
+      static double collision_horizon_base = 2.5;
+      static double goal_tol = 0.45;
+      static double vel_tol  = 0.25;
+      static double goal_hold_time = 0.35;
+      static bool   goal_require_low_vel = false;
+      if ((time_now - last_param_update).toSec() > 1.0 || last_param_update.toSec() == 0.0)
+      {
+        ros::param::param("~rmse_stop", rmse_stop, rmse_stop);
+        ros::param::param("~rmse_hold_time", rmse_hold, rmse_hold);
+        ros::param::param("~collision_stop_time", collision_stop_time, collision_stop_time);
+        ros::param::param("~collision_check_horizon", collision_horizon_base, collision_horizon_base);
+        ros::param::param("~goal_tolerance", goal_tol, goal_tol);
+        ros::param::param("~goal_vel_tolerance", vel_tol, vel_tol);
+        ros::param::param("~goal_hold_time", goal_hold_time, goal_hold_time);
+        ros::param::param("~goal_require_low_vel", goal_require_low_vel, goal_require_low_vel);
+        last_param_update = time_now;
+      }
+
       // 若 RMSE 已经足够小并稳定一段时间，直接结束（无需强行贴到 goal 点）
-      double rmse_stop = 0.015;
-      double rmse_hold = 0.40;
-      ros::param::param("~rmse_stop", rmse_stop, 0.015);
-      ros::param::param("~rmse_hold_time", rmse_hold, 0.40);
       if (rmseOkAndStable(rmse_stop, rmse_hold))
       {
         changeState(WAIT_TARGET, "RMSE_OK");
@@ -286,8 +304,8 @@ void execCallback(const ros::TimerEvent &e)
       {
         // 按速度自适应的前瞻：速度越快，需要更长 horizon 才能覆盖“重规划延迟+制动距离”
         const double v = odom_vel.norm();
-        double horizon_s = std::min(3.0, std::max(1.5, 1.0 + 0.6 * v));
-        ros::param::param("~collision_check_horizon", horizon_s, horizon_s);
+        double horizon_s = std::min(3.0, std::max(collision_horizon_base, 1.0 + 0.6 * v));
+        horizon_s = std::max(1.0, horizon_s);
 
         double t_hit = -1.0;
         if (trajUnsafeAhead(t_cur, horizon_s, &t_hit))
@@ -295,10 +313,8 @@ void execCallback(const ros::TimerEvent &e)
           last_force_replan_t = time_now;
 
           // 若碰撞发生得很近，则先 ABORT 让 traj_server 立刻悬停在当前点，避免“看见了但来不及躲”
-          double stop_time = 0.5;
-          ros::param::param("~collision_stop_time", stop_time, 0.5);
           const double time_to_hit = (t_hit > 0.0) ? std::max(0.0, t_hit - t_cur) : 0.0;
-          if (time_to_hit < stop_time)
+          if (time_to_hit < collision_stop_time)
             abortTrajServer();
 
           changeState(REPLAN_TRAJ, "COLLISION_AHEAD");
@@ -307,15 +323,6 @@ void execCallback(const ros::TimerEvent &e)
       }
 
       // 到达目标判定：增加“驻留时间”防抖，并支持到点后自动退出（便于记录总时间）
-      double goal_tol = 0.45;
-      double vel_tol  = 0.25;
-      double goal_hold_time = 0.35;
-      bool   goal_require_low_vel = false;
-      ros::param::param("~goal_tolerance", goal_tol, 0.45);
-      ros::param::param("~goal_vel_tolerance", vel_tol, 0.25);
-      ros::param::param("~goal_hold_time", goal_hold_time, 0.35);
-      ros::param::param("~goal_require_low_vel", goal_require_low_vel, false);
-
       static bool in_goal = false;
       static ros::Time goal_enter_t(0.0);
       const double dist_to_goal_now = (target_pt - odom_pt).norm();
@@ -372,21 +379,31 @@ void execCallback(const ros::TimerEvent &e)
         }
         return;
       }
-      else if ((target_pt - odom_pt).norm() < no_replan_thresh)
+      // 默认不做“周期性重规划”：
+      // - 周期性重规划会反复调用 A* + QP，显著造成卡顿，并导致点云/odom 回调处理变慢（信息更新滞后）。
+      // - 这里主要依赖 trajUnsafeAhead 的碰撞前瞻来触发 REPLAN（更及时、更少无谓重规划）。
+      static bool periodic_inited = false;
+      static bool enable_periodic_replan = false;
+      static double periodic_interval = 3.0;
+      static ros::Time last_periodic_replan_t(0.0);
+      if (!periodic_inited)
       {
-        return;
+        ros::param::param("~enable_periodic_replan", enable_periodic_replan, false);
+        ros::param::param("~periodic_replan_interval", periodic_interval, 3.0);
+        periodic_inited = true;
       }
-      else if ((start_pt - odom_pt).norm() < replan_thresh)
+
+      if (enable_periodic_replan)
       {
-        return;
-      }
-      else if (t_cur < t_replan)
-      {
-        return;
-      }
-      else
-      {
-        changeState(REPLAN_TRAJ, "STATE");
+        const double dist_goal = (target_pt - odom_pt).norm();
+        if (dist_goal > no_replan_thresh &&
+            (time_now - last_periodic_replan_t).toSec() > std::max(0.2, periodic_interval) &&
+            t_cur > 1.0 &&
+            (start_pt - odom_pt).norm() > replan_thresh)
+        {
+          last_periodic_replan_t = time_now;
+          changeState(REPLAN_TRAJ, "PERIODIC");
+        }
       }
       break;
     }
@@ -802,9 +819,19 @@ void visTrajectory(MatrixXd polyCoeff, VectorXd time)
   Vector3d             pos;
   geometry_msgs::Point pt;
 
+  // 轨迹可视化采样步长：默认 0.05s，避免每次重规划发布上万点导致 RViz/CPU 卡顿
+  static bool inited = false;
+  static double vis_dt = 0.05;
+  if (!inited)
+  {
+    ros::param::param("~vis_traj_dt", vis_dt, 0.05);
+    if (vis_dt < 0.005) vis_dt = 0.005;
+    inited = true;
+  }
+
   for (int i = 0; i < time.size(); i++)
   {
-    for (double t = 0.0; t < time(i); t += 0.01)
+    for (double t = 0.0; t < time(i); t += vis_dt)
     {
       pos = _trajGene->getPosPoly(polyCoeff, i, t);
       pt.x = pos(0);
@@ -844,9 +871,19 @@ void visTrajectory_before(MatrixXd polyCoeff, VectorXd time)
   Vector3d             pos;
   geometry_msgs::Point pt;
 
+  // 与 visTrajectory 保持一致的采样步长
+  static bool inited = false;
+  static double vis_dt = 0.05;
+  if (!inited)
+  {
+    ros::param::param("~vis_traj_dt", vis_dt, 0.05);
+    if (vis_dt < 0.005) vis_dt = 0.005;
+    inited = true;
+  }
+
   for (int i = 0; i < time.size(); i++)
   {
-    for (double t = 0.0; t < time(i); t += 0.01)
+    for (double t = 0.0; t < time(i); t += vis_dt)
     {
       pos = _trajGene->getPosPoly(polyCoeff, i, t);
       pt.x = pos(0);
@@ -985,23 +1022,32 @@ bool trajUnsafeAhead(double t_now, double horizon_s, double *t_hit_out = nullptr
   if (!has_traj) return false;
   if (!_astar_path_finder) return false;
 
-  int hard_xy_cells = 1, hard_z_cells = 0;
-  ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
-  ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+  // 参数缓存：避免前瞻检查 10Hz 频繁访问参数服务器导致卡顿
+  static ros::Time last_param_update(0.0);
+  static int  df_max_cells = 20;
+  static int  hard_xy_cells = 1, hard_z_cells = 0;
+  static bool use_clearance = true;
+  static double min_clearance_base_m = 0.22;
+  static double min_clearance_kv = 0.03;
+  static int    consec_hits_need = 3;
+  static double dt = 0.02;
+  const ros::Time now = ros::Time::now();
+  if ((now - last_param_update).toSec() > 1.0 || last_param_update.toSec() == 0.0)
+  {
+    ros::param::param("~distance_field_max_cells", df_max_cells, 20);
+    ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
+    ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+    ros::param::param("~collision_check_use_clearance", use_clearance, true);
+    ros::param::param("~collision_check_min_clearance_m", min_clearance_base_m, 0.22);
+    ros::param::param("~collision_check_min_clearance_kv", min_clearance_kv, 0.03);
+    ros::param::param("~collision_check_consecutive_hits", consec_hits_need, 3);
+    ros::param::param("~collision_check_dt", dt, 0.02);
+    if (dt < 0.005) dt = 0.005;
+    last_param_update = now;
+  }
 
-  // 关键：若只用“中心点落入占据格”作为触发，会出现“擦边撞上去”但不重规划的问题。
-  // 因此默认启用 clearance 阈值；同时用“连续命中”抑制噪声，避免缝隙处抖动。
-  bool   use_clearance = true;
-  double min_clearance_base_m = 0.18;
-  double min_clearance_kv = 0.03;  // extra clearance per (m/s) above 1m/s
-  int    consec_hits_need = 3;
-  ros::param::param("~collision_check_use_clearance", use_clearance, true);
-  ros::param::param("~collision_check_min_clearance_m", min_clearance_base_m, 0.18);
-  ros::param::param("~collision_check_min_clearance_kv", min_clearance_kv, 0.03);
-  ros::param::param("~collision_check_consecutive_hits", consec_hits_need, 3);
-
-  double dt = 0.05;  // 20Hz 预测检查
-  ros::param::param("~collision_check_dt", dt, 0.05);
+  // 更新距离场（增量），保证最新点云写入后 clearance 查询不会滞后
+  _astar_path_finder->ensureDistanceField(df_max_cells);
   const double t_end = std::max(t_now, std::min(time_duration, t_now + std::max(0.2, horizon_s)));
 
   static int consec_hits = 0;

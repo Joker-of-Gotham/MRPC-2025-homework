@@ -97,6 +97,12 @@ void Astarpath::begin_grid_map(double _resolution, Vector3d global_xyz_l,
       }
     }
   }
+
+  used_nodes_.clear();
+  pending_obs_addr_.clear();
+  dist_chess_.clear();
+  dist_inited_ = false;
+  dist_max_cells_ = 0;
 }
 
 void Astarpath::resetGrid(MappingNodePtr ptr) {
@@ -107,10 +113,12 @@ void Astarpath::resetGrid(MappingNodePtr ptr) {
 }
 
 void Astarpath::resetUsedGrids() {
-  for (int i = 0; i < GRID_X_SIZE; i++)
-    for (int j = 0; j < GRID_Y_SIZE; j++)
-      for (int k = 0; k < GRID_Z_SIZE; k++)
-        resetGrid(Map_Node[i][j][k]);
+  // 仅重置“用到过”的节点（数量远小于全图），避免每次规划 O(GRID_X*GRID_Y*GRID_Z) 卡顿
+  for (auto *p : used_nodes_)
+  {
+    if (p) resetGrid(p);
+  }
+  used_nodes_.clear();
 }
 
 void Astarpath::set_barrier(const double coord_x, const double coord_y,
@@ -130,7 +138,8 @@ void Astarpath::set_barrier(const double coord_x, const double coord_y,
     return;
 
   // raw mark
-  data_raw[idx_x * GLYZ_SIZE + idx_y * GRID_Z_SIZE + idx_z] = 1;
+  const int addr_raw = idx_x * GLYZ_SIZE + idx_y * GRID_Z_SIZE + idx_z;
+  data_raw[addr_raw] = 1;
 
   // margin from existing param
   static bool   inited = false;
@@ -144,10 +153,16 @@ void Astarpath::set_barrier(const double coord_x, const double coord_y,
   // - 这里的膨胀只用于把“点云离散化”后的栅格障碍连成片；
   // - 真正的安全距离主要由 A* 的 hard-clearance / safeCheck 来保证。
   // 过大的 set_barrier 膨胀会把可通过的“缝”堵死，导致后期 A* time budget hit/乱规划。
-  double infl_xy_base = 0.0;
-  double infl_z_base  = 0.0;
-  ros::param::param("~astar_inflation_xy_base", infl_xy_base, 0.0);
-  ros::param::param("~astar_inflation_z_base",  infl_z_base,  0.0);
+  // 性能关键：set_barrier 会被每帧点云调用成千上万次，绝不能在这里频繁访问参数服务器！
+  static bool infl_inited = false;
+  static double infl_xy_base = 0.0;
+  static double infl_z_base  = 0.0;
+  if (!infl_inited)
+  {
+    ros::param::param("~astar_inflation_xy_base", infl_xy_base, 0.0);
+    ros::param::param("~astar_inflation_z_base",  infl_z_base,  0.0);
+    infl_inited = true;
+  }
 
   const double infl_xy_m = std::max(0.0, infl_xy_base + margin_m);
   const double infl_z_m  = std::max(0.0, infl_z_base  + 0.5 * margin_m);
@@ -166,7 +181,13 @@ void Astarpath::set_barrier(const double coord_x, const double coord_y,
       for (int dz = -infl_z; dz <= infl_z; ++dz) {
         const int nz = idx_z + dz;
         if (nz < 0 || nz >= GRID_Z_SIZE) continue;
-        data[nx * GLYZ_SIZE + ny * GRID_Z_SIZE + nz] = 1;
+        const int addr = nx * GLYZ_SIZE + ny * GRID_Z_SIZE + nz;
+        if (data[addr] == 0)
+        {
+          data[addr] = 1;
+          // 仅在“新增占据”时记录，用于距离场增量更新（monotonic add）
+          pending_obs_addr_.push_back(addr);
+        }
       }
     }
   }
@@ -260,11 +281,159 @@ inline double clampd(double v, double a, double b) {
 
 } // namespace
 
+// ============================================================
+// Distance field (Chessboard/L∞, 26-neighborhood BFS)
+// - Conservative lower bound of Euclidean distance (L∞ <= L2), good for safety.
+// - Incremental update for monotonic obstacle additions (map/accumulate=true).
+// ============================================================
+void Astarpath::ensureDistanceField(int max_cells)
+{
+  if (max_cells < 0) max_cells = 0;
+  if (max_cells == 0)
+  {
+    // trivial: distance field not needed
+    dist_inited_ = false;
+    dist_chess_.clear();
+    pending_obs_addr_.clear();
+    dist_max_cells_ = 0;
+    return;
+  }
+
+  auto rebuildFull = [&](int cap_cells) {
+    dist_max_cells_ = std::max(1, cap_cells);
+    const uint16_t INF = (uint16_t)(dist_max_cells_ + 1);
+    dist_chess_.assign((size_t)GLXYZ_SIZE, INF);
+
+    std::queue<int> q;
+    q = std::queue<int>();
+
+    // init: all occupied cells as sources
+    for (int addr = 0; addr < GLXYZ_SIZE; ++addr)
+    {
+      if (data[addr] == 1)
+      {
+        dist_chess_[(size_t)addr] = 0;
+        q.push(addr);
+      }
+    }
+
+    // BFS (26-neighborhood, unit cost)
+    while (!q.empty())
+    {
+      const int addr = q.front(); q.pop();
+      const uint16_t d = dist_chess_[(size_t)addr];
+      if ((int)d >= dist_max_cells_) continue;
+
+      const int x = addr / GLYZ_SIZE;
+      const int rem = addr - x * GLYZ_SIZE;
+      const int y = rem / GRID_Z_SIZE;
+      const int z = rem - y * GRID_Z_SIZE;
+
+      for (int dx = -1; dx <= 1; ++dx)
+      for (int dy = -1; dy <= 1; ++dy)
+      for (int dz = -1; dz <= 1; ++dz)
+      {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        const int nx = x + dx;
+        const int ny = y + dy;
+        const int nz = z + dz;
+        if (nx < 0 || nx >= GRID_X_SIZE ||
+            ny < 0 || ny >= GRID_Y_SIZE ||
+            nz < 0 || nz >= GRID_Z_SIZE) continue;
+
+        const int naddr = nx * GLYZ_SIZE + ny * GRID_Z_SIZE + nz;
+        const uint16_t nd = (uint16_t)(d + 1);
+        if (nd < dist_chess_[(size_t)naddr])
+        {
+          dist_chess_[(size_t)naddr] = nd;
+          q.push(naddr);
+        }
+      }
+    }
+
+    dist_inited_ = true;
+    pending_obs_addr_.clear();
+  };
+
+  // need full rebuild?
+  if (!dist_inited_ ||
+      (int)dist_chess_.size() != GLXYZ_SIZE ||
+      max_cells > dist_max_cells_)
+  {
+    rebuildFull(max_cells);
+    return;
+  }
+
+  if (pending_obs_addr_.empty())
+    return;
+
+  // incremental update for monotonic obstacle additions
+  std::queue<int> q;
+  q = std::queue<int>();
+
+  for (int addr : pending_obs_addr_)
+  {
+    if (addr < 0 || addr >= GLXYZ_SIZE) continue;
+    if (data[addr] != 1) continue;
+    if (dist_chess_[(size_t)addr] != 0)
+    {
+      dist_chess_[(size_t)addr] = 0;
+      q.push(addr);
+    }
+  }
+  pending_obs_addr_.clear();
+  if (q.empty()) return;
+
+  while (!q.empty())
+  {
+    const int addr = q.front(); q.pop();
+    const uint16_t d = dist_chess_[(size_t)addr];
+    if ((int)d >= dist_max_cells_) continue;
+
+    const int x = addr / GLYZ_SIZE;
+    const int rem = addr - x * GLYZ_SIZE;
+    const int y = rem / GRID_Z_SIZE;
+    const int z = rem - y * GRID_Z_SIZE;
+
+    for (int dx = -1; dx <= 1; ++dx)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dz = -1; dz <= 1; ++dz)
+    {
+      if (dx == 0 && dy == 0 && dz == 0) continue;
+      const int nx = x + dx;
+      const int ny = y + dy;
+      const int nz = z + dz;
+      if (nx < 0 || nx >= GRID_X_SIZE ||
+          ny < 0 || ny >= GRID_Y_SIZE ||
+          nz < 0 || nz >= GRID_Z_SIZE) continue;
+
+      const int naddr = nx * GLYZ_SIZE + ny * GRID_Z_SIZE + nz;
+      const uint16_t nd = (uint16_t)(d + 1);
+      if (nd < dist_chess_[(size_t)naddr])
+      {
+        dist_chess_[(size_t)naddr] = nd;
+        q.push(naddr);
+      }
+    }
+  }
+}
+
 // compute nearest obstacle distance (meters) within a capped neighborhood.
 // if none found within max_r_cells => return (max_r_cells + 1) * resolution
 double Astarpath::nearestObsDistM(const Vector3i &idx, int max_r_cells) const
 {
   if (isOccupied(idx)) return 0.0;
+
+  // fast path: distance field available (lower bound, conservative)
+  if (dist_inited_ && (int)dist_chess_.size() == GLXYZ_SIZE)
+  {
+    const int cx = idx(0), cy = idx(1), cz = idx(2);
+    const int addr = cx * GLYZ_SIZE + cy * GRID_Z_SIZE + cz;
+    const uint16_t d = dist_chess_[(size_t)addr];
+    if ((int)d > max_r_cells)
+      return (max_r_cells + 1) * resolution;
+    return (double)d * resolution;
+  }
 
   const int cx = idx(0), cy = idx(1), cz = idx(2);
   int best_r2 = (max_r_cells + 1) * (max_r_cells + 1) + 1;
@@ -513,6 +682,8 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
   static int hard_z_cells  = 0;
   // any-angle upgrade (Theta*): reduce unnecessary turns/waypoints and improve passage through gaps
   static bool use_theta_star = true;
+  // distance field cap (cells)
+  static int df_max_cells = 20;
 
   if (!inited) {
     ros::param::param("~astar_max_search_time", max_search_time, 0.20);
@@ -531,6 +702,7 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
     ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
 
     ros::param::param("~astar_use_theta_star", use_theta_star, true);
+    ros::param::param("~distance_field_max_cells", df_max_cells, 20);
 
     inited = true;
   } else {
@@ -551,6 +723,9 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
   // cache for inner-loop successor expansion (AstarGetSucc)
   hard_xy_cells_ = hard_xy_cells;
   hard_z_cells_  = hard_z_cells;
+
+  // build/update distance field once per search (incremental, fast)
+  ensureDistanceField(df_max_cells);
 
   // RViz may send z=0; keep current altitude
   if (end_pt(2) <= gl_zl + kMinGoalZUp) end_pt(2) = start_pt(2);
@@ -732,6 +907,7 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
   startPtr->f_score = startPtr->g_score + w_astar * getHeu(startPtr, endPtr);
   startPtr->id = 1;
   startPtr->Father = NULL;
+  used_nodes_.push_back(startPtr);
 
   Openset.insert(make_pair(startPtr->f_score, startPtr));
 
@@ -802,6 +978,8 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
       endPtr->g_score = currentPtr->g_score + dist_goal;
       endPtr->f_score = endPtr->g_score;
       endPtr->id = 1;
+      // ensure reset later
+      if (endPtr != startPtr) used_nodes_.push_back(endPtr);
       terminatePtr = endPtr;
       g_reached_goal = true;
       return true;
@@ -865,6 +1043,7 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
         neighborPtr->f_score = best_g + w_astar * getHeu(neighborPtr, endPtr);
         neighborPtr->id = 1;
         neighborPtr->coord = gridIndex2coord(neighborPtr->index);
+        used_nodes_.push_back(neighborPtr);
         Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
       } else if (neighborPtr->id == 1) {
         if (best_g + 1e-9 < neighborPtr->g_score) {
@@ -934,6 +1113,11 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   int hard_xy_cells = 1, hard_z_cells = 0;
   ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
   ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+
+  // ensure distance field ready (used by sanitize/findDetour scoring)
+  static int df_max_cells = 20;
+  ros::param::param("~distance_field_max_cells", df_max_cells, 20);
+  ensureDistanceField(df_max_cells);
 
   double max_climb_deg = 20.0; // limit near-vertical segments
   ros::param::param("~astar_max_climb_deg", max_climb_deg, 20.0);
@@ -1348,6 +1532,11 @@ int Astarpath::safeCheck(MatrixXd polyCoeff, VectorXd time) {
   ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
   ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
 
+  // ensure distance field ready (used by optional clearance check)
+  static int df_max_cells = 20;
+  ros::param::param("~distance_field_max_cells", df_max_cells, 20);
+  ensureDistanceField(df_max_cells);
+
   // finer sampling：更密一些以降低“高速穿过细障碍但未被采样到”的概率
   const double dt_default = std::max(std::min(resolution * 0.20, 0.04), 0.01);
   double delta_t = dt_default;
@@ -1404,4 +1593,10 @@ void Astarpath::resetOccupy() {
         data[i * GLYZ_SIZE + j * GRID_Z_SIZE + k] = 0;
         data_raw[i * GLYZ_SIZE + j * GRID_Z_SIZE + k] = 0;
       }
+
+  // occupancy cleared => distance field invalid
+  dist_inited_ = false;
+  dist_chess_.clear();
+  pending_obs_addr_.clear();
+  dist_max_cells_ = 0;
 }
