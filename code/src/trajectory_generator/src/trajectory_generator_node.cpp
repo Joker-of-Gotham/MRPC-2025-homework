@@ -334,12 +334,11 @@ void rcvWaypointsCallBack(const nav_msgs::Path &wp)
 
   if (demox == 0)
   {
-    // 使用 waypoint_generator 发来的真实目标点（x/y/z）
-    target_pt << wp.poses[0].pose.position.x,
-                 wp.poses[0].pose.position.y,
-                 wp.poses[0].pose.position.z;
+    // 按 reference 约定：demox==0 时目标点的 x/y 固定为 (12, -4)，z 由 RViz 的 goal.z 指定
+    // （这样不会出现“终点随意定制”的情况）
+    target_pt << 12.0, -4.0, wp.poses[0].pose.position.z;
 
-    // RViz 2D goal 的 z 往往是 0，默认保持当前高度，避免无意义下钻导致撞柱
+    // 兼容：若 RViz 发送 z=0（常见 2D goal），则保持当前高度，避免无意义下钻
     if (target_pt(2) <= 1e-3)
       target_pt(2) = has_odom ? odom_pt(2) : 2.0;
   }
@@ -618,7 +617,9 @@ void trajOptimization(Eigen::MatrixXd path)
   visTrajectory(_polyCoeff, _polyTime);
 }
 
-// 关键：按 PolyCoeff 直接打包，不做 time 缩放
+// 关键：traj_server 内部用“归一化时间” s=t/T 来评估多项式，
+// 因此这里需要把 PolyQP 生成的系数（以真实时间 t 为自变量）转换为以 s 为自变量：
+//   p(t)=Σ a_j t^j = Σ (a_j T^j) s^j  (t=T*s)
 void trajPublish(MatrixXd polyCoeff, VectorXd time)
 {
   if (polyCoeff.size() == 0 || time.size() == 0)
@@ -655,9 +656,9 @@ void trajPublish(MatrixXd polyCoeff, VectorXd time)
   {
     for (unsigned int j = 0; j < poly_number; ++j)
     {
-      traj_msg.coef_x.push_back(polyCoeff(i, j));
-      traj_msg.coef_y.push_back(polyCoeff(i, poly_number + j));
-      traj_msg.coef_z.push_back(polyCoeff(i, 2 * poly_number + j));
+      traj_msg.coef_x.push_back(polyCoeff(i, j) * std::pow(time(i), (double)j));
+      traj_msg.coef_y.push_back(polyCoeff(i, poly_number + j) * std::pow(time(i), (double)j));
+      traj_msg.coef_z.push_back(polyCoeff(i, 2 * poly_number + j) * std::pow(time(i), (double)j));
     }
     traj_msg.time.push_back(time(i));
     traj_msg.order.push_back(traj_msg.num_order);
@@ -680,6 +681,17 @@ VectorXd timeAllocation(MatrixXd Path)
   const double t = _Vel / _Acc;
   const double d = 0.5 * _Acc * t * t;
 
+  // 可调的时间缩放与最小段时长：提高可跟踪性，降低 RMSE/抖动
+  static bool inited = false;
+  static double time_scale = 2.0;
+  static double min_seg_time = 0.5;
+  if (!inited)
+  {
+    ros::param::param("~planning/time_scale", time_scale, 2.0);
+    ros::param::param("~planning/min_seg_time", min_seg_time, 0.5);
+    inited = true;
+  }
+
   for (int i = 0; i < int(time.size()); i++)
   {
     piece = Path.row(i + 1) - Path.row(i);
@@ -692,8 +704,10 @@ VectorXd timeAllocation(MatrixXd Path)
     {
       time(i) = 2.0 * t + (dist - 2.0 * d) / _Vel;
     }
+
+    if (time(i) < min_seg_time) time(i) = min_seg_time;
   }
-  return 2 * time;
+  return time_scale * time;
 }
 
 void visTrajectory(MatrixXd polyCoeff, VectorXd time)

@@ -346,6 +346,11 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
   const int y = currentPtr->index(1);
   const int z = currentPtr->index(2);
 
+  // “逃逸模式”：若当前点处于 hard-clearance 区域内，允许扩展一些同样贴近障碍的点，
+  // 但要求它们能显著增大与障碍的距离（逐步爬出），否则会出现 openset exhausted/no progress 卡死。
+  const bool cur_too_close = isTooCloseHard(currentPtr->index, hard_xy_cells, hard_z_cells);
+  const double cur_clr = nearestObsDistM(currentPtr->index, 6);
+
   for (int dx = -1; dx <= 1; ++dx) {
     for (int dy = -1; dy <= 1; ++dy) {
       for (int dz = -1; dz <= 1; ++dz) {
@@ -359,28 +364,41 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
         Vector3i nidx(nx, ny, nz);
         if (isOccupied(nidx)) continue;
         // allow goal cell even if it violates hard-clearance (but never if occupied)
-        if (nidx != goalIdx && isTooCloseHard(nidx, hard_xy_cells, hard_z_cells)) continue;
+        if (nidx != goalIdx && isTooCloseHard(nidx, hard_xy_cells, hard_z_cells)) {
+          // escape: allow only if it increases clearance vs current
+          if (!(cur_too_close && (nearestObsDistM(nidx, 6) > cur_clr + 1e-3))) continue;
+        }
 
         // no corner cutting (also with clearance)
         Vector3i ax(x + dx, y, z);
         Vector3i bx(x, y + dy, z);
         Vector3i cx(x, y, z + dz);
 
-        if (dx != 0 && (isOccupied(ax) || isTooCloseHard(ax, hard_xy_cells, hard_z_cells))) continue;
-        if (dy != 0 && (isOccupied(bx) || isTooCloseHard(bx, hard_xy_cells, hard_z_cells))) continue;
-        if (dz != 0 && (isOccupied(cx) || isTooCloseHard(cx, hard_xy_cells, hard_z_cells))) continue;
+        // 在逃逸模式下，角点/边的 clearance 检查会把所有可行邻居剪没；
+        // 因此这里对“占据”仍严格禁止，但 clearance 只在非逃逸模式下强制。
+        if (dx != 0 && isOccupied(ax)) continue;
+        if (dy != 0 && isOccupied(bx)) continue;
+        if (dz != 0 && isOccupied(cx)) continue;
+        if (!cur_too_close) {
+          if (dx != 0 && isTooCloseHard(ax, hard_xy_cells, hard_z_cells)) continue;
+          if (dy != 0 && isTooCloseHard(bx, hard_xy_cells, hard_z_cells)) continue;
+          if (dz != 0 && isTooCloseHard(cx, hard_xy_cells, hard_z_cells)) continue;
+        }
 
         if (dx != 0 && dy != 0) {
           Vector3i cxy(x + dx, y + dy, z);
-          if (isOccupied(cxy) || isTooCloseHard(cxy, hard_xy_cells, hard_z_cells)) continue;
+          if (isOccupied(cxy)) continue;
+          if (!cur_too_close && isTooCloseHard(cxy, hard_xy_cells, hard_z_cells)) continue;
         }
         if (dx != 0 && dz != 0) {
           Vector3i cxz(x + dx, y, z + dz);
-          if (isOccupied(cxz) || isTooCloseHard(cxz, hard_xy_cells, hard_z_cells)) continue;
+          if (isOccupied(cxz)) continue;
+          if (!cur_too_close && isTooCloseHard(cxz, hard_xy_cells, hard_z_cells)) continue;
         }
         if (dy != 0 && dz != 0) {
           Vector3i cyz(x, y + dy, z + dz);
-          if (isOccupied(cyz) || isTooCloseHard(cyz, hard_xy_cells, hard_z_cells)) continue;
+          if (isOccupied(cyz)) continue;
+          if (!cur_too_close && isTooCloseHard(cyz, hard_xy_cells, hard_z_cells)) continue;
         }
 
         neighborPtrSets.push_back(Map_Node[nx][ny][nz]);
