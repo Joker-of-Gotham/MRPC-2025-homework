@@ -99,8 +99,11 @@ bool trajGeneration();
 VectorXd timeAllocation(MatrixXd Path);
 Vector3d getPos(double t_cur);
 Vector3d getVel(double t_cur);
+Vector3d getAcc(double t_cur);
+bool evalTraj(double t_cur, Vector3d *pos, Vector3d *vel, Vector3d *acc);
 void issafe(const ros::TimerEvent &e);
 void publishPositionCommand(double t_cur);  // *** 新增：按当前时间发布位置指令
+bool trajUnsafeAhead(double t_now, double horizon_s);
 
 // change the state to the new state
 void changeState(STATE new_state, string pos_call)
@@ -212,15 +215,42 @@ void execCallback(const ros::TimerEvent &e)
       // *** 在这里实时发送 PositionCommand
       publishPositionCommand(t_cur);
 
+      // 关键修复：用最新点云对“未来一小段轨迹”做碰撞预测，若即将穿障则立即触发重规划
+      // 这解决“障碍已在视野内但仍沿旧轨迹撞上去”的问题。
+      static ros::Time last_force_replan_t(0.0);
+      if ((time_now - last_force_replan_t).toSec() > 0.20)  // 5Hz 上限，避免抖动
+      {
+        double horizon_s = 1.2;  // 预测 1.2s 内的轨迹是否安全（可按速度自适应）
+        ros::param::param("~collision_check_horizon", horizon_s, 1.2);
+        if (trajUnsafeAhead(t_cur, horizon_s))
+        {
+          last_force_replan_t = time_now;
+          changeState(REPLAN_TRAJ, "COLLISION_AHEAD");
+          return;
+        }
+      }
+
+      // 关键修复：到达目标附近且速度足够小 -> 直接进入悬停，避免目标附近“转圈乱跑”
+      double goal_tol = 0.45;
+      double vel_tol  = 0.25;
+      ros::param::param("~goal_tolerance", goal_tol, 0.45);
+      ros::param::param("~goal_vel_tolerance", vel_tol, 0.25);
+      if ((target_pt - odom_pt).norm() < goal_tol && odom_vel.norm() < vel_tol)
+      {
+        has_traj   = false;
+        has_target = false;
+        changeState(WAIT_TARGET, "GOAL_REACHED");
+        return;
+      }
+
       if (t_cur > time_duration - 1e-2)
       {
         // 关键修复：只有真正到达目标附近才清空 has_target。
         // 若本段轨迹提前结束但距离目标仍远，则立即进入下一次规划，避免“卡死等待新目标”。
         const double dist_to_goal = (target_pt - odom_pt).norm();
-        const double goal_tol = 0.35;  // 可根据需要改成参数
 
         has_traj = false;
-        if (dist_to_goal < goal_tol)
+        if (dist_to_goal < goal_tol && odom_vel.norm() < vel_tol)
         {
           has_target = false;
           changeState(WAIT_TARGET, "STATE");
@@ -261,10 +291,22 @@ void execCallback(const ros::TimerEvent &e)
 
       ros::Time time_now = ros::Time::now();
       double    t_cur    = (time_now - time_traj_start).toSec();
-      double    t_delta  = ros::Duration(0, 50).toSec();
-      t_cur              = t_delta + t_cur;
-      start_pt           = getPos(t_cur);
-      start_vel          = getVel(t_cur);
+      // 预估一点点前向时间，补偿重规划延迟（原实现 ros::Duration(0,50) 仅 50ns，几乎为 0）
+      const double t_delta = 0.05;  // 50ms
+      t_cur = std::max(0.0, std::min(time_duration, t_cur + t_delta));
+
+      Vector3d pos, vel, acc;
+      if (evalTraj(t_cur, &pos, &vel, &acc))
+      {
+        start_pt  = pos;
+        start_vel = vel;
+      }
+      else
+      {
+        // fallback：用真实里程计
+        start_pt  = odom_pt;
+        start_vel = odom_vel;
+      }
 
       // *** REPLAN 时也先发一次当前 PositionCommand，防止控制器断指令
       publishPositionCommand(t_cur);
@@ -292,7 +334,14 @@ void rcvWaypointsCallBack(const nav_msgs::Path &wp)
 
   if (demox == 0)
   {
-    target_pt << 12.0, -4.0, wp.poses[0].pose.position.z;
+    // 使用 waypoint_generator 发来的真实目标点（x/y/z）
+    target_pt << wp.poses[0].pose.position.x,
+                 wp.poses[0].pose.position.y,
+                 wp.poses[0].pose.position.z;
+
+    // RViz 2D goal 的 z 往往是 0，默认保持当前高度，避免无意义下钻导致撞柱
+    if (target_pt(2) <= 1e-3)
+      target_pt(2) = has_odom ? odom_pt(2) : 2.0;
   }
   else
   {
@@ -803,40 +852,85 @@ void visPathA(MatrixXd nodes)
 
 Vector3d getPos(double t_cur)
 {
-  double   time = 0;
-  Vector3d pos  = Vector3d::Zero();
-  for (int i = 0; i < _polyTime.size(); i++)
-  {
-    for (double t = 0.0; t < _polyTime(i); t += 0.01)
-    {
-      time = time + 0.01;
-      if (time > t_cur)
-      {
-        pos = _trajGene->getPosPoly(_polyCoeff, i, t);
-        return pos;
-      }
-    }
-  }
-  return pos;
+  Vector3d p;
+  if (evalTraj(t_cur, &p, nullptr, nullptr))
+    return p;
+  return Vector3d::Zero();
 }
 
 Vector3d getVel(double t_cur)
 {
-  double   time = 0;
-  Vector3d Vel  = Vector3d::Zero();
-  for (int i = 0; i < _polyTime.size(); i++)
+  Vector3d v;
+  if (evalTraj(t_cur, nullptr, &v, nullptr))
+    return v;
+  return Vector3d::Zero();
+}
+
+Vector3d getAcc(double t_cur)
+{
+  Vector3d a;
+  if (evalTraj(t_cur, nullptr, nullptr, &a))
+    return a;
+  return Vector3d::Zero();
+}
+
+// 精确地在分段多项式上求值（旧版用 0.01 离散积分，容易因为 > / 超界导致返回 0，引发倒飞/乱跑）
+bool evalTraj(double t_cur, Vector3d *pos, Vector3d *vel, Vector3d *acc)
+{
+  if (!has_traj) return false;
+  if (_polyCoeff.rows() <= 0 || _polyTime.size() <= 0) return false;
+
+  // clamp time into [0, total]
+  const double total = _polyTime.sum();
+  double t = std::max(0.0, std::min(total, t_cur));
+
+  for (int i = 0; i < _polyTime.size(); ++i)
   {
-    for (double t = 0.0; t < _polyTime(i); t += 0.01)
+    const double Ti = _polyTime(i);
+    const bool last = (i == _polyTime.size() - 1);
+    if (t <= Ti + 1e-9 || last)
     {
-      time = time + 0.01;
-      if (time > t_cur)
-      {
-        Vel = _trajGene->getVelPoly(_polyCoeff, i, t);
-        return Vel;
-      }
+      const double tl = std::max(0.0, std::min(Ti, t));
+      if (pos) *pos = _trajGene->getPosPoly(_polyCoeff, i, tl);
+      if (vel) *vel = _trajGene->getVelPoly(_polyCoeff, i, tl);
+      if (acc) *acc = _trajGene->getAccPoly(_polyCoeff, i, tl);
+      return true;
     }
+    t -= Ti;
   }
-  return Vel;
+  return false;
+}
+
+// 预测未来一段轨迹是否会碰撞（使用最新占据栅格 + hard-clearance）
+bool trajUnsafeAhead(double t_now, double horizon_s)
+{
+  if (!has_traj) return false;
+  if (!_astar_path_finder) return false;
+
+  int hard_xy_cells = 1, hard_z_cells = 0;
+  ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
+  ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+
+  double dt = 0.05;  // 20Hz 预测检查
+  ros::param::param("~collision_check_dt", dt, 0.05);
+  const double t_end = std::max(t_now, std::min(time_duration, t_now + std::max(0.2, horizon_s)));
+
+  for (double t = t_now; t <= t_end + 1e-9; t += dt)
+  {
+    Vector3d pos = getPos(t);
+
+    // map bounds check（越界直接认为不安全，触发重规划）
+    if (pos(0) < _map_lower(0) || pos(0) > _map_upper(0) ||
+        pos(1) < _map_lower(1) || pos(1) > _map_upper(1) ||
+        pos(2) < _map_lower(2) || pos(2) > _map_upper(2))
+      return true;
+
+    const Vector3i idx = _astar_path_finder->c2i(pos);
+    if (_astar_path_finder->is_occupy(idx)) return true;
+    if (_astar_path_finder->isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return true;
+  }
+
+  return false;
 }
 
 // *** 新增：根据当前时间 t_cur 发布 /position_cmd
@@ -852,6 +946,7 @@ void publishPositionCommand(double t_cur)
 
   Vector3d pos = getPos(t_cur);
   Vector3d vel = getVel(t_cur);
+  Vector3d acc = getAcc(t_cur);
 
   quadrotor_msgs::PositionCommand cmd;
   cmd.header.stamp    = ros::Time::now();
@@ -865,11 +960,16 @@ void publishPositionCommand(double t_cur)
   cmd.velocity.y = vel(1);
   cmd.velocity.z = vel(2);
 
-  cmd.acceleration.x = 0.0;
-  cmd.acceleration.y = 0.0;
-  cmd.acceleration.z = 0.0;
+  cmd.acceleration.x = acc(0);
+  cmd.acceleration.y = acc(1);
+  cmd.acceleration.z = acc(2);
 
-  cmd.yaw     = atan2(vel(1), vel(0));
+  // yaw：低速/停住时保持上一次 yaw，避免 atan2(0,0) 抖动导致“目标附近乱跑”
+  static double last_yaw = 0.0;
+  const double vxy = std::sqrt(vel(0) * vel(0) + vel(1) * vel(1));
+  if (vxy > 0.15)
+    last_yaw = std::atan2(vel(1), vel(0));
+  cmd.yaw     = last_yaw;
   cmd.yaw_dot = 0.0;
 
   cmd.trajectory_id   = 0;

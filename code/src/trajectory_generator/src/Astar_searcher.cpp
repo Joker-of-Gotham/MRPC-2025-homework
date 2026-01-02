@@ -358,7 +358,8 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
 
         Vector3i nidx(nx, ny, nz);
         if (isOccupied(nidx)) continue;
-        if (isTooCloseHard(nidx, hard_xy_cells, hard_z_cells)) continue;
+        // allow goal cell even if it violates hard-clearance (but never if occupied)
+        if (nidx != goalIdx && isTooCloseHard(nidx, hard_xy_cells, hard_z_cells)) continue;
 
         // no corner cutting (also with clearance)
         Vector3i ax(x + dx, y, z);
@@ -436,9 +437,6 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
   static int    soft_scan_cells = 6;
   static double soft_w = 0.80;
 
-  // min acceptable clearance for “execute a partial path”
-  static double min_exec_clearance_m = 0.35;
-
   // hard clearance neighborhood
   static int hard_xy_cells = 1;
   static int hard_z_cells  = 0;
@@ -456,8 +454,6 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
     ros::param::param("~astar_soft_clearance_scan_cells", soft_scan_cells, 6);
     ros::param::param("~astar_soft_clearance_weight", soft_w, 0.80);
 
-    ros::param::param("~astar_min_exec_clearance_m", min_exec_clearance_m, 0.35);
-
     ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
     ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
 
@@ -472,7 +468,6 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
     ros::param::get("~astar_soft_clearance_range_m", soft_range_m);
     ros::param::get("~astar_soft_clearance_scan_cells", soft_scan_cells);
     ros::param::get("~astar_soft_clearance_weight", soft_w);
-    ros::param::get("~astar_min_exec_clearance_m", min_exec_clearance_m);
     ros::param::get("~astar_hard_clearance_xy", hard_xy_cells);
     ros::param::get("~astar_hard_clearance_z", hard_z_cells);
   }
@@ -515,13 +510,26 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
     return true;
   };
 
+  // endpoint-safe: allow start/goal to be close to obstacles, but never inside obstacles/outside map
+  auto pointFree = [&](const Vector3d& p) -> bool {
+    if (!insideMap(p)) return false;
+    Vector3i idx = coord2gridIndex(p);
+    if (isOccupied(idx)) return false;
+    return true;
+  };
+
   auto segmentSafe = [&](const Vector3d& a, const Vector3d& b) -> bool {
     const double L = (b - a).norm();
     const int N = std::max(1, (int)std::ceil(L / los_step));
     for (int i = 0; i <= N; ++i) {
       const double t = (double)i / (double)N;
       const Vector3d p = a + t * (b - a);
-      if (!pointSafe(p)) return false;
+      const bool endpoint = (i == 0 || i == N);
+      if (endpoint) {
+        if (!pointFree(p)) return false;
+      } else {
+        if (!pointSafe(p)) return false;
+      }
     }
     return true;
   };
@@ -585,31 +593,37 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
   };
 
   // snap start / goal
-  if (isOccupied(start_idx) || isTooCloseHard(start_idx, hard_xy_cells, hard_z_cells)) {
+  // 只在“真正落在占据栅格内”时才 snap，避免仅因 hard-clearance 导致起点跳变（倒飞/抖动）
+  if (isOccupied(start_idx)) {
     Vector3i sfree;
     if (nearestFreeBest(start_idx, sfree)) {
       start_idx = sfree;
       start_pt  = gridIndex2coord(start_idx);
       g_start_cont = start_pt;
-      ROS_WARN("[A*] Start unsafe, snapped to best nearby safe cell.");
+      ROS_WARN("[A*] Start occupied, snapped to best nearby free cell.");
     } else {
-      ROS_ERROR("[A*] Start unsafe and no nearby safe cell found.");
+      ROS_ERROR("[A*] Start occupied and no nearby free cell found.");
       return false;
     }
+  } else if (isTooCloseHard(start_idx, hard_xy_cells, hard_z_cells)) {
+    ROS_WARN_THROTTLE(0.5, "[A*] Start too close to obstacle (hard-clearance), keep continuous start and plan away.");
   }
 
-  if (isOccupied(end_idx) || isTooCloseHard(end_idx, hard_xy_cells, hard_z_cells)) {
+  if (isOccupied(end_idx)) {
     Vector3i gfree;
     if (nearestFreeBest(end_idx, gfree)) {
       end_idx = gfree;
       end_pt  = gridIndex2coord(end_idx);
       g_goal_cont = end_pt;
       goalIdx = end_idx;
-      ROS_WARN("[A*] Goal unsafe, snapped to best nearby safe cell.");
+      ROS_WARN("[A*] Goal occupied, snapped to best nearby free cell.");
     } else {
-      ROS_ERROR("[A*] Goal unsafe and no nearby safe cell found.");
+      ROS_ERROR("[A*] Goal occupied and no nearby free cell found.");
       return false;
     }
+  } else if (isTooCloseHard(end_idx, hard_xy_cells, hard_z_cells)) {
+    // goal 允许违反 hard-clearance（只要不在障碍内），便于靠近目标；AstarGetSucc 已对 goalIdx 放行
+    ROS_WARN_THROTTLE(0.5, "[A*] Goal too close to obstacle (hard-clearance), allow goal but enforce clearance on path interior.");
   }
 
   MappingNodePtr startPtr = Map_Node[start_idx(0)][start_idx(1)][start_idx(2)];
@@ -850,13 +864,26 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
     return true;
   };
 
+  // endpoint-safe：端点允许贴近障碍（但不能在障碍内/越界）
+  auto pointFree = [&](const Vector3d& p) -> bool {
+    if (!insideMap(p)) return false;
+    Vector3i idx = coord2gridIndex(p);
+    if (isOccupied(idx)) return false;
+    return true;
+  };
+
   auto segmentSafe = [&](const Vector3d& a, const Vector3d& b) -> bool {
     const double L = (b - a).norm();
     const int N = std::max(1, (int)std::ceil(L / los_step));
     for (int i = 0; i <= N; ++i) {
       const double t = (double)i / (double)N;
       const Vector3d p = a + t * (b - a);
-      if (!pointSafe(p)) return false;
+      const bool endpoint = (i == 0 || i == N);
+      if (endpoint) {
+        if (!pointFree(p)) return false;
+      } else {
+        if (!pointSafe(p)) return false;
+      }
     }
     return true;
   };
@@ -895,12 +922,22 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   if (clean.size() < 2) return clean;
 
   // anchor endpoints
-  // - 起点：用连续起点坐标（避免“贴格子中心”带来的微小抖动）
-  // - 终点：只有 A* 真正到达 goalIdx 时才用连续目标点覆盖，否则保持部分路径终点
+  // - 起点：优先保持连续坐标，只有落在障碍内才 sanitize（避免仅因 clearance 导致起点跳变）
+  // - 终点：只有 A* 真正到达 goalIdx 时才用连续目标点覆盖
   if (g_have_cont) {
-    clean.front() = sanitizePoint(g_start_cont);
-    if (g_reached_goal) clean.back() = sanitizePoint(g_goal_cont);
-    else clean.back() = sanitizePoint(clean.back());
+    Vector3d s = g_start_cont;
+    clampIntoMap(s);
+    if (!pointFree(s)) s = sanitizePoint(s);  // occupied/outside only
+    clean.front() = s;
+
+    if (g_reached_goal) {
+      Vector3d g = g_goal_cont;
+      clampIntoMap(g);
+      if (!pointFree(g)) g = sanitizePoint(g);
+      clean.back() = g;
+    } else {
+      clean.back() = sanitizePoint(clean.back());
+    }
   } else {
     clean.front() = sanitizePoint(clean.front());
     clean.back()  = sanitizePoint(clean.back());
