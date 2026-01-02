@@ -119,6 +119,7 @@ void issafe(const ros::TimerEvent &e);
 void publishPositionCommand(double t_cur);  // *** 新增：按当前时间发布位置指令
 bool trajUnsafeAhead(double t_now, double horizon_s, double *t_hit_out);
 void publishRmse(double t_cur);
+bool rmseOkAndStable(double threshold, double hold_s);
 
 // change the state to the new state
 void changeState(STATE new_state, string pos_call)
@@ -231,6 +232,27 @@ void execCallback(const ros::TimerEvent &e)
       publishPositionCommand(t_cur);
       // *** 实时 RMSE（用于观察误差收敛）
       publishRmse(t_cur);
+
+      // 若 RMSE 已经足够小并稳定一段时间，直接结束（无需强行贴到 goal 点）
+      double rmse_stop = 0.015;
+      double rmse_hold = 0.40;
+      ros::param::param("~rmse_stop", rmse_stop, 0.015);
+      ros::param::param("~rmse_hold_time", rmse_hold, 0.40);
+      if (rmseOkAndStable(rmse_stop, rmse_hold))
+      {
+        abortTrajServer();
+        changeState(WAIT_TARGET, "RMSE_OK");
+        if (g_auto_shutdown_on_goal && !g_shutdown_scheduled)
+        {
+          g_shutdown_scheduled = true;
+          if (g_nh_ptr)
+            g_shutdown_timer = g_nh_ptr->createTimer(ros::Duration(std::max(0.0, g_shutdown_delay_s)),
+                                                    shutdownCb, true);
+          else
+            ros::requestShutdown();
+        }
+        return;
+      }
 
       // 关键修复：用最新点云对“未来一小段轨迹”做碰撞预测，若即将穿障则立即触发重规划
       // 这解决“障碍已在视野内但仍沿旧轨迹撞上去”的问题。
@@ -586,7 +608,8 @@ void abortTrajServer()
 void shutdownCb(const ros::TimerEvent & /*e*/)
 {
   ROS_WARN("[node] goal reached, auto shutdown.");
-  ros::shutdown();
+  // requestShutdown 更安全：避免在回调队列中直接 shutdown 引发 boost::lock_error
+  ros::requestShutdown();
 }
 
 bool trajOptimization(const Eigen::MatrixXd &path_in, const Eigen::MatrixXd &path_raw_in)
@@ -1094,6 +1117,29 @@ void publishRmse(double t_cur)
   _rmse_pub.publish(msg);
 
   ROS_INFO_THROTTLE(0.5, "[RMSE] online=%.4f (N=%lu)", rmse, (unsigned long)g_rmse_n);
+}
+
+// 当在线 RMSE 低于阈值并稳定保持一段时间后，认为“足够好”可自动结束（用户要求 RMSE<=0.015 即可停止）
+bool rmseOkAndStable(double threshold, double hold_s)
+{
+  if (g_rmse_n < 20) return false;  // 需要一定样本量
+  const double rmse = std::sqrt(g_rmse_sumsq / std::max(1.0, (double)g_rmse_n * 3.0));
+
+  static bool in_ok = false;
+  static ros::Time ok_enter(0.0);
+  const ros::Time now = ros::Time::now();
+
+  if (rmse <= threshold)
+  {
+    if (!in_ok) { in_ok = true; ok_enter = now; }
+    if ((now - ok_enter).toSec() >= std::max(0.0, hold_s))
+      return true;
+  }
+  else
+  {
+    in_ok = false;
+  }
+  return false;
 }
 
 int main(int argc, char **argv)

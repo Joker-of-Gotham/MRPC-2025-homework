@@ -329,6 +329,38 @@ double Astarpath::softClearancePenalty(const Vector3i &idx,
 }
 
 // ============================================================
+// Fast grid LoS (Bresenham-like) for Theta*
+// Checks occupancy + hard-clearance along the discrete line
+// ============================================================
+bool Astarpath::lineOfSight(const Eigen::Vector3i &a,
+                            const Eigen::Vector3i &b,
+                            int hard_xy_cells,
+                            int hard_z_cells) const
+{
+  // 3D DDA traversal (fast, robust)
+  const Eigen::Vector3d p0 = gridIndex2coord(a);
+  const Eigen::Vector3d p1 = gridIndex2coord(b);
+  Eigen::Vector3d d = p1 - p0;
+  const double L = d.norm();
+  if (L < 1e-6)
+    return true;
+  d /= L;
+
+  // step roughly one grid per iteration
+  const double step = std::max(0.5 * resolution, 0.05);
+  const int N = std::max(1, (int)std::ceil(L / step));
+  for (int i = 0; i <= N; ++i)
+  {
+    const double t = (double)i / (double)N;
+    const Eigen::Vector3d p = p0 + t * (p1 - p0);
+    const Eigen::Vector3i idx = coord2gridIndex(p);
+    if (isOccupied(idx)) return false;
+    if (isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return false;
+  }
+  return true;
+}
+
+// ============================================================
 // Successors (26-neighborhood + NO corner cutting + hard clearance)
 // ============================================================
 
@@ -792,7 +824,7 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
       if (use_theta_star && currentPtr->Father != NULL) {
         const Vector3d ncoord = gridIndex2coord(neighborPtr->index);
         MappingNodePtr p = currentPtr->Father;
-        if (segmentSafe(p->coord, ncoord)) {
+        if (lineOfSight(p->index, neighborPtr->index, hard_xy_cells, hard_z_cells)) {
           double g_theta = p->g_score + (ncoord - p->coord).norm();
           // keep penalties roughly consistent (endpoint-based)
           g_theta += soft_w * softClearancePenalty(neighborPtr->index, soft_range_m, soft_scan_cells);
@@ -1078,11 +1110,16 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
     return best;
   };
 
-  // adaptive split lengths
-  const double base_open = std::min(6.0, std::max(3.5, 10.0 * path_resolution));
-  const double base_mid  = std::min(3.0, std::max(2.0,  6.0 * path_resolution));
-  const double base_near = std::min(1.5, std::max(1.0,  3.5 * path_resolution));
-  const double kMinSplitLenM = std::max(0.8, 2.5 * path_resolution);
+  // adaptive split lengths (tuned to avoid over-dense points that slow down planning/execution)
+  // 默认更“稀疏”：让多项式与前瞻碰撞承担安全性，减少 out=25 这种超密点
+  double base_open = std::min(8.0, std::max(5.0, 16.0 * path_resolution));
+  double base_mid  = std::min(5.0, std::max(3.0, 10.0 * path_resolution));
+  double base_near = std::min(3.0, std::max(2.0,  6.0 * path_resolution));
+  double kMinSplitLenM = std::max(1.5, 4.0 * path_resolution);
+  ros::param::param("~pathsplit/base_open", base_open, base_open);
+  ros::param::param("~pathsplit/base_mid",  base_mid,  base_mid);
+  ros::param::param("~pathsplit/base_near", base_near, base_near);
+  ros::param::param("~pathsplit/min_len",   kMinSplitLenM, kMinSplitLenM);
 
   std::vector<Vector3d> out;
   out.reserve(fillet.size() * 2);
