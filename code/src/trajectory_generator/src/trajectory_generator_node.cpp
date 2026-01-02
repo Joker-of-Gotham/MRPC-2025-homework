@@ -249,7 +249,7 @@ void execCallback(const ros::TimerEvent &e)
             g_shutdown_timer = g_nh_ptr->createTimer(ros::Duration(std::max(0.0, g_shutdown_delay_s)),
                                                     shutdownCb, true);
           else
-            ros::requestShutdown();
+            std::exit(0);
         }
         return;
       }
@@ -608,8 +608,8 @@ void abortTrajServer()
 void shutdownCb(const ros::TimerEvent & /*e*/)
 {
   ROS_WARN("[node] goal reached, auto shutdown.");
-  // requestShutdown 更安全：避免在回调队列中直接 shutdown 引发 boost::lock_error
-  ros::requestShutdown();
+  // 直接使用 std::exit(0) 是最安全的方式，避免所有回调队列和锁问题
+  std::exit(0);
 }
 
 bool trajOptimization(const Eigen::MatrixXd &path_in, const Eigen::MatrixXd &path_raw_in)

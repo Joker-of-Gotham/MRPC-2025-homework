@@ -27,6 +27,10 @@ class Astarpath
 		MappingNodePtr terminatePtr;
 		std::multimap<double, MappingNodePtr> Openset;
 
+		// 缓存的参数（在 AstarSearch 开头初始化一次，避免频繁调用 ros::param::param）
+		int hard_xy_cells_ = 2;
+		int hard_z_cells_  = 0;
+
 		double getHeu(MappingNodePtr node1, MappingNodePtr node2);
 		void AstarGetSucc(MappingNodePtr currentPtr, std::vector<MappingNodePtr> & neighborPtrSets, std::vector<double> & edgeCostSets);		
 		Eigen::Vector3d gridIndex2coord(const Eigen::Vector3i & index) const;

@@ -58,9 +58,9 @@
     
     <!-- A* 搜索参数 -->
     <param name="astar_max_search_time"     value="0.35"/>
-    <!-- hard-clearance：回到 1 格（0.2m@0.2m 分辨率），让“可通过的缝”不过度被封死；
-         具体安全由 soft-clearance + 前瞻碰撞与必要时制动保证 -->
-    <param name="astar_hard_clearance_xy"   value="1"/>
+    <!-- hard-clearance：增加到 2 格（0.4m@0.2m 分辨率），让规划路径远离障碍物，
+         避免高速飞行时因轨迹跟踪误差导致穿越障碍 -->
+    <param name="astar_hard_clearance_xy"   value="2"/>
     <param name="astar_hard_clearance_z"    value="0"/>
     <param name="astar_soft_clearance_range_m" value="0.60"/>
     <!-- soft-clearance：偏好大间距通道，但不至于把可通过缝全部判掉 -->
