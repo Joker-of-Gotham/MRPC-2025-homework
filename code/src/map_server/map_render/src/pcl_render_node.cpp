@@ -107,8 +107,11 @@ void rcvGlobalPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map)
 
     has_global_map = true;
 
-    // visualize: publish raw map
-    global_map_vis_pub.publish(pointcloud_map);
+    // visualize: publish downsampled map (RViz rendering of huge raw clouds is a major source of lag)
+    sensor_msgs::PointCloud2 map_vis;
+    pcl::toROSMsg(_cloud_all_map, map_vis);
+    map_vis.header.frame_id = map_frame_name;
+    global_map_vis_pub.publish(map_vis);
 }
 
 void rcvGlobalGroundPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map)

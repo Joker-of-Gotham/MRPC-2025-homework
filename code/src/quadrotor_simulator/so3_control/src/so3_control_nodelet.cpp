@@ -13,6 +13,7 @@
 // for logging + paths
 #include <ros/package.h>   // ros::package::getPath (roslib)
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <cstdlib>
 
@@ -77,6 +78,8 @@ private:
   std::string timedata_roshome_path_;
   double timedata_log_dt_;
   double last_timedata_log_t_;
+  double timedata_flush_dt_ = 0.5;
+  double last_timedata_flush_t_ = -1.0;
 };
 
 void SO3ControlNodelet::publishSO3Command(void)
@@ -124,12 +127,22 @@ void SO3ControlNodelet::appendTimedata_(double t)
   if (timedata_pkg_file_.is_open())
   {
     timedata_pkg_file_ << std::fixed << std::setprecision(9) << t << "\n";
-    timedata_pkg_file_.flush();
   }
-  if (timedata_roshome_file_.is_open())
+  // 仅当 pkg 文件不可用时才写 ROS_HOME，避免双写带来的 IO 压力
+  else if (timedata_roshome_file_.is_open())
   {
     timedata_roshome_file_ << std::fixed << std::setprecision(9) << t << "\n";
-    timedata_roshome_file_.flush();
+  }
+
+  // 低频 flush，避免每条记录 flush 导致系统卡顿
+  if (timedata_flush_dt_ > 0.0)
+  {
+    if (last_timedata_flush_t_ < 0.0 || (t - last_timedata_flush_t_) >= timedata_flush_dt_)
+    {
+      if (timedata_pkg_file_.is_open()) timedata_pkg_file_.flush();
+      if (!timedata_pkg_file_.is_open() && timedata_roshome_file_.is_open()) timedata_roshome_file_.flush();
+      last_timedata_flush_t_ = t;
+    }
   }
   last_timedata_log_t_ = t;
 }
@@ -187,6 +200,10 @@ void SO3ControlNodelet::openTimedataLogs_(const ros::NodeHandle& nh)
   // allow user override of log rate
   nh.param("log/timedata_dt", timedata_log_dt_, 0.02);
   if (timedata_log_dt_ < 0.0) timedata_log_dt_ = 0.0;
+
+  nh.param("log/timedata_flush_dt", timedata_flush_dt_, 0.5);
+  if (timedata_flush_dt_ < 0.0) timedata_flush_dt_ = 0.0;
+  last_timedata_flush_t_ = -1.0;
 }
 
 void SO3ControlNodelet::position_cmd_callback(
