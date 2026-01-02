@@ -460,6 +460,8 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
   // hard clearance neighborhood
   static int hard_xy_cells = 1;
   static int hard_z_cells  = 0;
+  // any-angle upgrade (Theta*): reduce unnecessary turns/waypoints and improve passage through gaps
+  static bool use_theta_star = true;
 
   if (!inited) {
     ros::param::param("~astar_max_search_time", max_search_time, 0.20);
@@ -477,6 +479,8 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
     ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
     ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
 
+    ros::param::param("~astar_use_theta_star", use_theta_star, true);
+
     inited = true;
   } else {
     // allow runtime tuning
@@ -490,6 +494,7 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
     ros::param::get("~astar_soft_clearance_weight", soft_w);
     ros::param::get("~astar_hard_clearance_xy", hard_xy_cells);
     ros::param::get("~astar_hard_clearance_z", hard_z_cells);
+    ros::param::get("~astar_use_theta_star", use_theta_star);
   }
 
   // RViz may send z=0; keep current altitude
@@ -780,20 +785,37 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
         }
       }
 
-      double tentative_g_score = currentPtr->g_score + g_inc;
+      // Theta* parent-relaxation: try to connect neighbor directly from current's parent if LOS exists
+      MappingNodePtr bestParent = currentPtr;
+      double best_g = currentPtr->g_score + g_inc;
+
+      if (use_theta_star && currentPtr->Father != NULL) {
+        const Vector3d ncoord = gridIndex2coord(neighborPtr->index);
+        MappingNodePtr p = currentPtr->Father;
+        if (segmentSafe(p->coord, ncoord)) {
+          double g_theta = p->g_score + (ncoord - p->coord).norm();
+          // keep penalties roughly consistent (endpoint-based)
+          g_theta += soft_w * softClearancePenalty(neighborPtr->index, soft_range_m, soft_scan_cells);
+          g_theta += zdev_w * std::fabs(ncoord(2) - nominal_z);
+          if (g_theta + 1e-6 < best_g) {
+            best_g = g_theta;
+            bestParent = p;
+          }
+        }
+      }
 
       if (neighborPtr->id == 0) {
-        neighborPtr->Father  = currentPtr;
-        neighborPtr->g_score = tentative_g_score;
-        neighborPtr->f_score = tentative_g_score + w_astar * getHeu(neighborPtr, endPtr);
+        neighborPtr->Father  = bestParent;
+        neighborPtr->g_score = best_g;
+        neighborPtr->f_score = best_g + w_astar * getHeu(neighborPtr, endPtr);
         neighborPtr->id = 1;
         neighborPtr->coord = gridIndex2coord(neighborPtr->index);
         Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
       } else if (neighborPtr->id == 1) {
-        if (tentative_g_score + 1e-9 < neighborPtr->g_score) {
-          neighborPtr->Father  = currentPtr;
-          neighborPtr->g_score = tentative_g_score;
-          neighborPtr->f_score = tentative_g_score + w_astar * getHeu(neighborPtr, endPtr);
+        if (best_g + 1e-9 < neighborPtr->g_score) {
+          neighborPtr->Father  = bestParent;
+          neighborPtr->g_score = best_g;
+          neighborPtr->f_score = best_g + w_astar * getHeu(neighborPtr, endPtr);
           neighborPtr->coord = gridIndex2coord(neighborPtr->index);
           Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
         }

@@ -103,7 +103,7 @@ Vector3d getAcc(double t_cur);
 bool evalTraj(double t_cur, Vector3d *pos, Vector3d *vel, Vector3d *acc);
 void issafe(const ros::TimerEvent &e);
 void publishPositionCommand(double t_cur);  // *** 新增：按当前时间发布位置指令
-bool trajUnsafeAhead(double t_now, double horizon_s);
+bool trajUnsafeAhead(double t_now, double horizon_s, double *t_hit_out);
 
 // change the state to the new state
 void changeState(STATE new_state, string pos_call)
@@ -218,13 +218,25 @@ void execCallback(const ros::TimerEvent &e)
       // 关键修复：用最新点云对“未来一小段轨迹”做碰撞预测，若即将穿障则立即触发重规划
       // 这解决“障碍已在视野内但仍沿旧轨迹撞上去”的问题。
       static ros::Time last_force_replan_t(0.0);
-      if ((time_now - last_force_replan_t).toSec() > 0.20)  // 5Hz 上限，避免抖动
+      if ((time_now - last_force_replan_t).toSec() > 0.10)  // 10Hz 上限，提升反应速度
       {
-        double horizon_s = 1.2;  // 预测 1.2s 内的轨迹是否安全（可按速度自适应）
-        ros::param::param("~collision_check_horizon", horizon_s, 1.2);
-        if (trajUnsafeAhead(t_cur, horizon_s))
+        // 按速度自适应的前瞻：速度越快，需要更长 horizon 才能覆盖“重规划延迟+制动距离”
+        const double v = odom_vel.norm();
+        double horizon_s = std::min(3.0, std::max(1.5, 1.0 + 0.6 * v));
+        ros::param::param("~collision_check_horizon", horizon_s, horizon_s);
+
+        double t_hit = -1.0;
+        if (trajUnsafeAhead(t_cur, horizon_s, &t_hit))
         {
           last_force_replan_t = time_now;
+
+          // 若碰撞发生得很近，则先 ABORT 让 traj_server 立刻悬停在当前点，避免“看见了但来不及躲”
+          double stop_time = 0.5;
+          ros::param::param("~collision_stop_time", stop_time, 0.5);
+          const double time_to_hit = (t_hit > 0.0) ? std::max(0.0, t_hit - t_cur) : 0.0;
+          if (time_to_hit < stop_time)
+            abortTrajServer();
+
           changeState(REPLAN_TRAJ, "COLLISION_AHEAD");
           return;
         }
@@ -596,12 +608,12 @@ VectorXd timeAllocation(MatrixXd Path)
 
   // 可调的时间缩放与最小段时长：提高可跟踪性，降低 RMSE/抖动
   static bool inited = false;
-  static double time_scale = 1.5;
-  static double min_seg_time = 0.2;
+  static double time_scale = 1.3;
+  static double min_seg_time = 0.15;
   if (!inited)
   {
-    ros::param::param("~planning/time_scale", time_scale, 1.5);
-    ros::param::param("~planning/min_seg_time", min_seg_time, 0.2);
+    ros::param::param("~planning/time_scale", time_scale, 1.3);
+    ros::param::param("~planning/min_seg_time", min_seg_time, 0.15);
     inited = true;
   }
 
@@ -829,7 +841,7 @@ bool evalTraj(double t_cur, Vector3d *pos, Vector3d *vel, Vector3d *acc)
 }
 
 // 预测未来一段轨迹是否会碰撞（使用最新占据栅格；可选基于 clearance 的“近碰撞”触发）
-bool trajUnsafeAhead(double t_now, double horizon_s)
+bool trajUnsafeAhead(double t_now, double horizon_s, double *t_hit_out = nullptr)
 {
   if (!has_traj) return false;
   if (!_astar_path_finder) return false;
@@ -841,10 +853,12 @@ bool trajUnsafeAhead(double t_now, double horizon_s)
   // 关键：若只用“中心点落入占据格”作为触发，会出现“擦边撞上去”但不重规划的问题。
   // 因此默认启用 clearance 阈值；同时用“连续命中”抑制噪声，避免缝隙处抖动。
   bool   use_clearance = true;
-  double min_clearance_m = 0.25;
+  double min_clearance_base_m = 0.18;
+  double min_clearance_kv = 0.03;  // extra clearance per (m/s) above 1m/s
   int    consec_hits_need = 3;
   ros::param::param("~collision_check_use_clearance", use_clearance, true);
-  ros::param::param("~collision_check_min_clearance_m", min_clearance_m, 0.25);
+  ros::param::param("~collision_check_min_clearance_m", min_clearance_base_m, 0.18);
+  ros::param::param("~collision_check_min_clearance_kv", min_clearance_kv, 0.03);
   ros::param::param("~collision_check_consecutive_hits", consec_hits_need, 3);
 
   double dt = 0.05;  // 20Hz 预测检查
@@ -852,6 +866,8 @@ bool trajUnsafeAhead(double t_now, double horizon_s)
   const double t_end = std::max(t_now, std::min(time_duration, t_now + std::max(0.2, horizon_s)));
 
   static int consec_hits = 0;
+  double t_hit = -1.0;
+  if (t_hit_out) *t_hit_out = -1.0;
 
   for (double t = t_now; t <= t_end + 1e-9; t += dt)
   {
@@ -869,12 +885,18 @@ bool trajUnsafeAhead(double t_now, double horizon_s)
     if (use_clearance)
     {
       // 使用距离场近似（局部扫描）来做“近碰撞”判断，避免 hard-clearance 过于二值化导致频繁触发
+      const double v = odom_vel.norm();
+      const double min_clearance_m = std::max(0.0, min_clearance_base_m + min_clearance_kv * std::max(0.0, v - 1.0));
       const double clr = _astar_path_finder->nearestObsDistM(idx, 8);
-      if (clr < std::max(0.0, min_clearance_m))
+      if (clr < min_clearance_m)
       {
         consec_hits++;
         if (consec_hits >= std::max(1, consec_hits_need))
+        {
+          t_hit = t;
+          if (t_hit_out) *t_hit_out = t_hit;
           return true;
+        }
       }
       else
       {
@@ -883,7 +905,7 @@ bool trajUnsafeAhead(double t_now, double horizon_s)
 
       // 可选：如果你仍想保留 hard-clearance 的语义（但只在非常贴近时触发）
       if (_astar_path_finder->isTooCloseHard(idx, hard_xy_cells, hard_z_cells) &&
-          clr < std::max(0.0, min_clearance_m + 1e-3))
+          clr < min_clearance_m + 1e-3)
         return true;
     }
   }

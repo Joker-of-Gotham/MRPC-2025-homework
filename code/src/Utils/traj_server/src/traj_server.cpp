@@ -64,6 +64,10 @@ private:
 
     sensor_msgs::PointCloud2 traj_pts;
     pcl::PointCloud<pcl::PointXYZ> traj_pts_pcd;
+
+    // hover behavior control (for emergency abort / goal reached)
+    bool _hover_from_odom = false;
+    geometry_msgs::Point _hover_pos;
 public:
     
     vector<Eigen::VectorXd> CList;   // Position coefficients vector, used to record all the pre-compute 'n choose k' combinatorial for the bernstein coefficients .
@@ -205,6 +209,7 @@ public:
             if ((int)traj.trajectory_id < _traj_id) return ;
 
             state = TRAJ;
+            _hover_from_odom = false;
             _traj_flag = quadrotor_msgs::PositionCommand::TRAJECTORY_STATUS_READY;
             _traj_id = traj.trajectory_id;
             _n_segment = traj.num_segment;
@@ -250,6 +255,9 @@ public:
             ROS_WARN("[SERVER] Aborting the trajectory.");
             state = HOVER;
             _traj_flag = quadrotor_msgs::PositionCommand::TRAJECTORY_STATUS_COMPLETED;
+            // freeze at current odom position for true emergency braking/stop
+            _hover_from_odom = true;
+            _hover_pos = _odom.pose.pose.position;
         }
         else if (traj.action == quadrotor_msgs::PolynomialTrajectory::ACTION_WARN_IMPOSSIBLE)
         {
@@ -264,8 +272,9 @@ public:
         if (state == INIT) return;
         if (state == HOVER)
         {
-            if (_cmd.header.frame_id != "world"){
-                _cmd.position = _odom.pose.pose.position;
+            if (_hover_from_odom)
+            {
+                _cmd.position = _hover_pos;
             }
 
             _cmd.header.stamp = _odom.header.stamp;

@@ -27,13 +27,13 @@
     <remap from="~odom"             to="/visual_slam/odom"/>
 
     <!-- 轨迹规划参数 -->
-    <param name="planning/vel"       value="3.0"/>
-    <param name="planning/acc"       value="2.0"/>
+    <param name="planning/vel"       value="3.5"/>
+    <param name="planning/acc"       value="2.5"/>
     <param name="planning/dev_order" value="3"/>
     <param name="planning/min_order" value="3"/>
     <!-- 时间分配：适度放缓即可提升可跟踪性；过大将显著拉长总时间 -->
-    <param name="planning/time_scale"   value="1.5"/>
-    <param name="planning/min_seg_time" value="0.2"/>
+    <param name="planning/time_scale"   value="1.3"/>
+    <param name="planning/min_seg_time" value="0.15"/>
 
     <!-- 可视化与地图参数 -->
     <param name="vis/vis_traj_width" value="0.07"/>
@@ -52,23 +52,29 @@
     
     <!-- A* 搜索参数 -->
     <param name="astar_max_search_time"     value="0.35"/>
-    <!-- hard-clearance：提高到 2 格（0.4m@0.2m 分辨率），避免走“看似能过但实际会擦撞”的小缝 -->
-    <param name="astar_hard_clearance_xy"   value="2"/>
+    <!-- hard-clearance：回到 1 格（0.2m@0.2m 分辨率），让“可通过的缝”不过度被封死；
+         具体安全由 soft-clearance + 前瞻碰撞与必要时制动保证 -->
+    <param name="astar_hard_clearance_xy"   value="1"/>
     <param name="astar_hard_clearance_z"    value="0"/>
     <param name="astar_soft_clearance_range_m" value="0.60"/>
-    <!-- soft-clearance：更偏好大间距通道（仍允许绕行时更安全） -->
-    <param name="astar_soft_clearance_weight"  value="0.90"/>
+    <!-- soft-clearance：偏好大间距通道，但不至于把可通过缝全部判掉 -->
+    <param name="astar_soft_clearance_weight"  value="0.70"/>
+    <!-- any-angle Theta*：减少不必要拐弯和中间点，提升通过缝隙能力 -->
+    <param name="astar_use_theta_star" value="true"/>
     <!-- set_barrier 的点云栅格膨胀：设太大容易把可通过的缝堵死 -->
     <param name="astar_inflation_xy_base" value="0.0"/>
     <param name="astar_inflation_z_base"  value="0.0"/>
 
     <!-- 轨迹前瞻碰撞预测（障碍进入视野后能立刻触发重规划） -->
-    <param name="collision_check_horizon" value="2.0"/>
+    <param name="collision_check_horizon" value="2.5"/>
     <param name="collision_check_dt"      value="0.05"/>
     <!-- 前瞻碰撞：默认启用 clearance 阈值 + 连续命中抑制噪声 -->
     <param name="collision_check_use_clearance" value="true"/>
-    <param name="collision_check_min_clearance_m" value="0.25"/>
+    <param name="collision_check_min_clearance_m" value="0.18"/>
+    <param name="collision_check_min_clearance_kv" value="0.03"/>
     <param name="collision_check_consecutive_hits" value="3"/>
+    <!-- 若预计碰撞时间 < stop_time，则先 ABORT 立即悬停制动 -->
+    <param name="collision_stop_time" value="0.5"/>
 
     <!-- 到位判定（目标附近不再抖动/乱跑） -->
     <param name="goal_tolerance"      value="0.45"/>
