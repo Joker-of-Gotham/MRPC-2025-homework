@@ -277,10 +277,8 @@ int main(int argc, char **argv)
    ros::init(argc, argv, "random_complex_scene");
    ros::NodeHandle n("~");
 
-   // 性能关键：全局地图是静态的，持续发布超大 PointCloud2 会让 RViz/ROS 通信长期卡顿。
-   // 使用 latched publisher 仅发布一次，保证新订阅者也能收到。
-   _all_map_pub = n.advertise<sensor_msgs::PointCloud2>("global_map", 1, true);
-   _all_ground_pub = n.advertise<sensor_msgs::PointCloud2>("global_ground", 1, true);
+   _all_map_pub = n.advertise<sensor_msgs::PointCloud2>("global_map", 1);
+   _all_ground_pub = n.advertise<sensor_msgs::PointCloud2>("global_ground", 1);
    _odom_sub = n.subscribe("odometry", 50, rcvOdometryCallbck);
 
    n.param("init_state_x", _init_x, 0.0);
@@ -316,16 +314,21 @@ int main(int argc, char **argv)
   //  RandomMapGenerate(true);
 
    if(choice == 0){
-     // 与 reference 一致：只生成障碍物点云（global_map）。
-     // ground 不再生成巨量点云，避免无意义的通信/反序列化开销导致卡顿。
+     // 生成障碍物点云 + 地面点云，避免 global_ground 为空导致下游解析/时序不稳定
      RandomMapGenerate(true);   // obstacles -> globalMap_pcd
+     RandomMapGenerate(false);  // ground    -> globalGround_pcd
    }else{
      FixedMapGenerate();        // fixed scene -> globalMap_pcd
+     RandomMapGenerate(false);  // also publish a valid ground cloud
    }
-
-   // publish once (latched)
-   _all_map_pub.publish(globalMap_pcd);
-   if (globalGround_pcd.data.size() > 0) _all_ground_pub.publish(globalGround_pcd);
-
-   ros::spin();
+   ros::Rate loop_rate(_sense_rate);
+   // 先发布 global_map（障碍物），让下游优先建立 KDTree
+   bool ground_map_swt = false;
+   while (ros::ok())
+   {
+      pubSensedPoints(ground_map_swt);
+      ground_map_swt = !ground_map_swt;
+      ros::spinOnce();
+      loop_rate.sleep();
+   }
 }

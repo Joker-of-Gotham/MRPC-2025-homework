@@ -1,6 +1,5 @@
 #include <iostream>
 #include <fstream>
-#include <iomanip>
 
 #include <ros/ros.h>
 #include <so3_control/SO3Control.h>
@@ -9,8 +8,6 @@ namespace
 {
 // 简单的调试日志，用于画 tracking 曲线（保持你原来的需求）
 std::ofstream g_ctrl_data_file;
-double g_last_ctrl_flush_t = -1.0;
-double g_ctrl_flush_dt = 0.5; // seconds (flush at 2Hz by default)
 } // namespace
 
 SO3Control::SO3Control()
@@ -68,15 +65,6 @@ void SO3Control::calculateControl(const Eigen::Vector3d& des_pos,
     if (!g_ctrl_data_file)
     {
       ROS_WARN_STREAM("SO3Control: failed to open control_data.txt for logging");
-    }
-    else
-    {
-      // 性能关键：不要每行 flush（会导致全系统卡顿）。只低频 flush 即可保证评测可读。
-      g_ctrl_data_file.setf(std::ios::fixed);
-      g_ctrl_data_file << std::setprecision(6);
-      ros::param::param("~so3_control/log/flush_dt", g_ctrl_flush_dt, 0.5);
-      if (g_ctrl_flush_dt < 0.0) g_ctrl_flush_dt = 0.0;
-      g_last_ctrl_flush_t = -1.0;
     }
   }
 
@@ -136,17 +124,8 @@ void SO3Control::calculateControl(const Eigen::Vector3d& des_pos,
     const ros::Time t_now = ros::Time::now();
     g_ctrl_data_file << t_now.toSec() << " "
                      << des_pos.x() << " " << des_pos.y() << " " << des_pos.z() << " "
-                     << pos_.x()   << " " << pos_.y()   << " " << pos_.z()   << "\n";
-
-    if (g_ctrl_flush_dt == 0.0)
-      return;
-
-    const double tsec = t_now.toSec();
-    if (g_last_ctrl_flush_t < 0.0 || (tsec - g_last_ctrl_flush_t) >= g_ctrl_flush_dt)
-    {
-      g_ctrl_data_file.flush();
-      g_last_ctrl_flush_t = tsec;
-    }
+                     << pos_.x()   << " " << pos_.y()   << " " << pos_.z()   << " "
+                     << std::endl;
   }
 }
 
