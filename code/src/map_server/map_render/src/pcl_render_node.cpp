@@ -81,39 +81,34 @@ vector<int> _pointIdxRadiusSearch;
 vector<float> _pointRadiusSquaredDistance;
 
 pcl::PointCloud<pcl::PointXYZ> cloud_input;
+
+// sensing filters (make local_pointcloud reliable for planning)
+bool   use_front_filter = false;
+bool   use_vertical_filter = false;
+double vertical_half_angle_deg = 15.0;
+double voxel_leaf = 0.10;
 void rcvGlobalPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map)
 {
     if (has_global_map)
         return;
 
-    //transform map to point cloud format
+    ROS_WARN("Global map received..");
+
+    // transform map to point cloud format (obstacles only)
     pcl::fromROSMsg(pointcloud_map, cloud_input);
-    has_global_map = has_global_ground && true;
-    // for visualize only
-    pcl::PointCloud<pcl::PointXYZ> cloud_vis;
-    sensor_msgs::PointCloud2 map_vis;
-    pcl::PointXYZ pt;
-    
-    if( (int)cloud_input.points.size() == 0 ) return;
+    if ((int)cloud_input.points.size() == 0)
+      return;
 
-    for (int idx = 0; idx < (int)cloud_input.points.size(); idx++)
-    {    
-        pt = cloud_input.points[idx];
-        Vector3d cor_round = gridIndex2coord(coord2gridIndex(Vector3d(pt.x, pt.y, pt.z)));
-        pt.x = cor_round(0);
-        pt.y = cor_round(1);
-        pt.z = cor_round(2);
-        cloud_vis.points.push_back(pt);
-    }
+    // downsample & build KDTree for local sensing
+    _voxel_sampler.setLeafSize((float)voxel_leaf, (float)voxel_leaf, (float)voxel_leaf);
+    _voxel_sampler.setInputCloud(cloud_input.makeShared());
+    _voxel_sampler.filter(_cloud_all_map);
+    _kdtreeLocalMap.setInputCloud(_cloud_all_map.makeShared());
 
-    cloud_vis.width    = cloud_vis.points.size();
-    cloud_vis.height   = 1;
-    cloud_vis.is_dense = true;
+    has_global_map = true;
 
-    pcl::toROSMsg(cloud_vis, map_vis);
-
-    map_vis.header.frame_id = "world";
-    global_map_vis_pub.publish(map_vis);
+    // visualize: publish raw map
+    global_map_vis_pub.publish(pointcloud_map);
 }
 
 void rcvGlobalGroundPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map)
@@ -122,53 +117,9 @@ void rcvGlobalGroundPointCloudCallBack(const sensor_msgs::PointCloud2 &pointclou
         return;
 
     ROS_WARN("Global Pointcloud received..");
-    //load global map
-    pcl::PointCloud<pcl::PointXYZ> cloudIn;
-    pcl::PointXYZ pt_in;
-    //transform map to point cloud format
-    pcl::fromROSMsg(pointcloud_map, cloudIn);
-    for (int i = 0; i < int(cloudIn.points.size()); i++)
-    {
-        pt_in = cloudIn.points[i];
-        cloud_input.push_back(pt_in);
-    }
-    printf("global map has points: %d.\n", (int)cloud_input.size());
-
+    // ground cloud is only for visualization; do NOT gate global_map loading on this topic.
+    global_ground_vis_pub.publish(pointcloud_map);
     has_global_ground = true;
-
-    _voxel_sampler.setLeafSize(0.1f, 0.1f, 0.1f);
-    _voxel_sampler.setInputCloud(cloud_input.makeShared());
-    _voxel_sampler.filter(_cloud_all_map);
-
-    _kdtreeLocalMap.setInputCloud(_cloud_all_map.makeShared());
-
-    has_global_map = has_global_ground && true;
-
-    // for visualize only
-    pcl::PointCloud<pcl::PointXYZ> cloud_vis;
-    sensor_msgs::PointCloud2 map_vis;
-    pcl::PointXYZ pt;
-    
-    if( (int)cloudIn.points.size() == 0 ) return;
-
-    for (int idx = 0; idx < (int)cloudIn.points.size(); idx++)
-    {    
-        pt = cloudIn.points[idx];
-        Vector3d cor_round = gridIndex2coord(coord2gridIndex(Vector3d(pt.x, pt.y, pt.z)));
-        pt.x = cor_round(0);
-        pt.y = cor_round(1);
-        pt.z = cor_round(2);
-        cloud_vis.points.push_back(pt);
-    }
-
-    cloud_vis.width    = cloud_vis.points.size();
-    cloud_vis.height   = 1;
-    cloud_vis.is_dense = true;
-
-    pcl::toROSMsg(cloud_vis, map_vis);
-
-    map_vis.header.frame_id = "world";
-    global_ground_vis_pub.publish(map_vis);
 }
 
 void renderSensedPoints(const ros::TimerEvent &event)
@@ -198,13 +149,20 @@ void renderSensedPoints(const ros::TimerEvent &event)
         {
             pt = _cloud_all_map.points[_pointIdxRadiusSearch[i]];
 
-            if ((fabs(pt.z - _odom.pose.pose.position.z) / (sensing_horizon)) > tan(M_PI / 12.0))
-                continue;
+            if (use_vertical_filter)
+            {
+                const double th = vertical_half_angle_deg * M_PI / 180.0;
+                if ((fabs(pt.z - _odom.pose.pose.position.z) / (sensing_horizon)) > tan(th))
+                    continue;
+            }
 
             Vector3d pt_vec(pt.x - _odom.pose.pose.position.x, pt.y - _odom.pose.pose.position.y, pt.z - _odom.pose.pose.position.z);
 
-            if (pt_vec.dot(yaw_vec) < 0)
-                continue;
+            if (use_front_filter)
+            {
+                if (pt_vec.dot(yaw_vec) < 0)
+                    continue;
+            }
             _local_map.points.push_back(pt);
         }
     }
@@ -239,6 +197,12 @@ int main(int argc, char **argv)
     nh.getParam("map_frame_name", map_frame_name);
 
     nh.param("map/resolution", _resolution, 0.2);
+
+    // sensing / filtering params
+    nh.param("sensing/use_front_filter", use_front_filter, false);
+    nh.param("sensing/use_vertical_filter", use_vertical_filter, false);
+    nh.param("sensing/vertical_half_angle_deg", vertical_half_angle_deg, 15.0);
+    nh.param("sensing/voxel_leaf", voxel_leaf, 0.10);
 
     //subscribe point cloud
     global_map_sub      = nh.subscribe("global_map", 1, rcvGlobalPointCloudCallBack);

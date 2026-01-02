@@ -10,7 +10,7 @@
   <arg name="start_y" default="1.0"/>
   <arg name="start_z" default="2.0"/>
 
-  <arg name="sensing_horizon" default="5.0"/>
+  <arg name="sensing_horizon" default="8.0"/>
   <arg name="sensing_rate"    default="30.0"/>
   <arg name="estimation_rate" default="30.0"/>
 
@@ -79,6 +79,15 @@
     <!-- 到位判定（目标附近不再抖动/乱跑） -->
     <param name="goal_tolerance"      value="0.45"/>
     <param name="goal_vel_tolerance"  value="0.25"/>
+    <param name="goal_hold_time"      value="0.35"/>
+    <param name="goal_require_low_vel" value="false"/>
+    <!-- 到达目标后自动退出（required=true 会触发 roslaunch 退出，便于统计 total_time） -->
+    <param name="auto_shutdown_on_goal" value="true"/>
+    <param name="shutdown_delay" value="0.5"/>
+
+    <!-- 地图更新：累积占据（静态环境更安全，减少“遗忘障碍”导致穿障/回撞） -->
+    <param name="map/accumulate" value="true"/>
+    <param name="map/min_valid_points" value="20"/>
 
     <!-- 作业里 demox 标志 -->
     <param name="planning/demox" value="0"/>
@@ -143,6 +152,11 @@
     <param name="map/y_size"      value="$(arg map_size_y)"/>
     <param name="map/z_size"      value="$(arg map_size_z)"/>
     <param name="map_frame_name"  value="$(arg map_frame_name)"/>
+    <!-- 让 local_pointcloud 更“可靠”：默认不做前向视野裁剪，避免因机体朝向导致漏检障碍 -->
+    <param name="sensing/use_front_filter" value="false"/>
+    <param name="sensing/use_vertical_filter" value="false"/>
+    <param name="sensing/vertical_half_angle_deg" value="15.0"/>
+    <param name="sensing/voxel_leaf" value="0.10"/>
 
     <remap from="~global_map"    to="/random_complex/global_map"/>
     <remap from="~global_ground" to="/random_complex/global_ground"/>

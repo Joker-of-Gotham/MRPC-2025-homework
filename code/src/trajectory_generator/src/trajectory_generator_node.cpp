@@ -16,6 +16,7 @@
 #include <ros/console.h>
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <std_msgs/Float64.h>
 #include <string>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
@@ -50,6 +51,7 @@ ros::Subscriber _map_sub, _pts_sub, _odom_sub;
 ros::Publisher _traj_vis_pub, _traj_before_vis_pub, _traj_pub, _path_vis_pub,
     _astar_path_vis_pub;
 ros::Publisher _pos_cmd_pub;  // *** 新增：位置指令发布器
+ros::Publisher _rmse_pub;     // *** 新增：实时 RMSE 发布器
 
 // for planning
 Vector3d odom_pt, odom_vel, start_pt, target_pt, start_vel;
@@ -61,6 +63,10 @@ ros::Time time_traj_start;
 bool has_odom   = false;
 bool has_target = false;
 bool has_traj   = false;  // *** 当前是否有可用轨迹
+
+// online RMSE统计（与 calculate_results.py 一致：sqrt(mean(diff^2))，对 3 个维度取全局均值）
+static double   g_rmse_sumsq = 0.0;   // Σ ||e||^2
+static uint64_t g_rmse_n     = 0;     // 样本数
 
 // for replanning
 enum STATE
@@ -81,6 +87,14 @@ bool cracked;
 int time_Count;
 int target_Count;
 ros::Timer _record_timer_;
+
+// auto shutdown on goal (trajectory_generator_node is required=true in launch, so roslaunch will exit)
+static bool   g_auto_shutdown_on_goal = true;
+static double g_shutdown_delay_s      = 0.5;
+static bool   g_shutdown_scheduled    = false;
+static ros::NodeHandle *g_nh_ptr      = nullptr;
+static ros::Timer g_shutdown_timer;
+void shutdownCb(const ros::TimerEvent &e);
 
 // declare
 void changeState(STATE new_state, string pos_call);
@@ -104,6 +118,7 @@ bool evalTraj(double t_cur, Vector3d *pos, Vector3d *vel, Vector3d *acc);
 void issafe(const ros::TimerEvent &e);
 void publishPositionCommand(double t_cur);  // *** 新增：按当前时间发布位置指令
 bool trajUnsafeAhead(double t_now, double horizon_s, double *t_hit_out);
+void publishRmse(double t_cur);
 
 // change the state to the new state
 void changeState(STATE new_state, string pos_call)
@@ -214,6 +229,8 @@ void execCallback(const ros::TimerEvent &e)
 
       // *** 在这里实时发送 PositionCommand
       publishPositionCommand(t_cur);
+      // *** 实时 RMSE（用于观察误差收敛）
+      publishRmse(t_cur);
 
       // 关键修复：用最新点云对“未来一小段轨迹”做碰撞预测，若即将穿障则立即触发重规划
       // 这解决“障碍已在视野内但仍沿旧轨迹撞上去”的问题。
@@ -242,18 +259,45 @@ void execCallback(const ros::TimerEvent &e)
         }
       }
 
-      // 关键修复：到达目标附近且速度足够小 -> 直接进入悬停，避免目标附近“转圈乱跑”
+      // 到达目标判定：增加“驻留时间”防抖，并支持到点后自动退出（便于记录总时间）
       double goal_tol = 0.45;
       double vel_tol  = 0.25;
+      double goal_hold_time = 0.35;
+      bool   goal_require_low_vel = false;
       ros::param::param("~goal_tolerance", goal_tol, 0.45);
       ros::param::param("~goal_vel_tolerance", vel_tol, 0.25);
-      if ((target_pt - odom_pt).norm() < goal_tol && odom_vel.norm() < vel_tol)
+      ros::param::param("~goal_hold_time", goal_hold_time, 0.35);
+      ros::param::param("~goal_require_low_vel", goal_require_low_vel, false);
+
+      static bool in_goal = false;
+      static ros::Time goal_enter_t(0.0);
+      const double dist_to_goal_now = (target_pt - odom_pt).norm();
+      if (dist_to_goal_now < goal_tol)
       {
-        has_traj   = false;
-        has_target = false;
-        abortTrajServer();  // 防止 traj_server 继续沿旧轨迹“跑过头/折返”
-        changeState(WAIT_TARGET, "GOAL_REACHED");
-        return;
+        if (!in_goal) { in_goal = true; goal_enter_t = time_now; }
+        const bool vel_ok = (!goal_require_low_vel) || (odom_vel.norm() < vel_tol);
+        if (vel_ok && (time_now - goal_enter_t).toSec() > std::max(0.0, goal_hold_time))
+        {
+          has_traj   = false;
+          has_target = false;
+          abortTrajServer();  // 防止 traj_server 继续沿旧轨迹“跑过头/折返”
+          changeState(WAIT_TARGET, "GOAL_REACHED");
+
+          if (g_auto_shutdown_on_goal && !g_shutdown_scheduled)
+          {
+            g_shutdown_scheduled = true;
+            if (g_nh_ptr)
+              g_shutdown_timer = g_nh_ptr->createTimer(ros::Duration(std::max(0.0, g_shutdown_delay_s)),
+                                                      shutdownCb, true);
+            else
+              ros::shutdown();
+          }
+          return;
+        }
+      }
+      else
+      {
+        in_goal = false;
       }
 
       if (t_cur > time_duration - 1e-2)
@@ -263,11 +307,21 @@ void execCallback(const ros::TimerEvent &e)
         const double dist_to_goal = (target_pt - odom_pt).norm();
 
         has_traj = false;
-        if (dist_to_goal < goal_tol && odom_vel.norm() < vel_tol)
+        if (dist_to_goal < goal_tol && ((!goal_require_low_vel) || (odom_vel.norm() < vel_tol)))
         {
           has_target = false;
           abortTrajServer();
           changeState(WAIT_TARGET, "STATE");
+
+          if (g_auto_shutdown_on_goal && !g_shutdown_scheduled)
+          {
+            g_shutdown_scheduled = true;
+            if (g_nh_ptr)
+              g_shutdown_timer = g_nh_ptr->createTimer(ros::Duration(std::max(0.0, g_shutdown_delay_s)),
+                                                      shutdownCb, true);
+            else
+              ros::shutdown();
+          }
         }
         else
         {
@@ -357,6 +411,10 @@ void rcvWaypointsCallBack(const nav_msgs::Path &wp)
   start_vel  = odom_vel;
   has_target = true;
 
+  // reset online RMSE stats for this run
+  g_rmse_sumsq = 0.0;
+  g_rmse_n     = 0;
+
   if (exec_state == WAIT_TARGET)
     changeState(GEN_NEW_TRAJ, "STATE");
   else if (exec_state == EXEC_TRAJ)
@@ -370,22 +428,63 @@ void rcvPointCloudCallBack(const sensor_msgs::PointCloud2 &pointcloud_map)
 
   if ((int)cloud.points.size() == 0)
   {
-    // 关键修复：点云为空时不要清空上一帧占据栅格。
-    // 否则会在“短暂空帧/转换失败/视野裁剪导致空帧”时把地图清成全空，出现穿障与误判安全。
+    // 点云为空时不要清空上一帧占据栅格：否则会出现“短暂空帧->地图全空->穿障”
     ROS_WARN_THROTTLE(1.0, "[map] local_pointcloud empty, keep last occupancy map.");
     return;
   }
 
-  _astar_path_finder->resetOccupy();  // 仅当本帧点云有效时，才清空并写入新占据
+  // 地图更新策略：默认累积占据（静态环境更安全、更少遗忘），可用参数关闭
+  static bool inited = false;
+  static bool accumulate = true;
+  static int  min_valid_pts = 20;
+  if (!inited)
+  {
+    ros::param::param("~map/accumulate", accumulate, true);
+    ros::param::param("~map/min_valid_points", min_valid_pts, 20);
+    inited = true;
+  }
 
   pcl::PointXYZ pt;
-  for (int idx = 0; idx < (int)cloud.points.size(); idx++)
+  int valid = 0;
+
+  if (accumulate)
   {
-    pt = cloud.points[idx];
-    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
-    // set obstacles into grid map for path planning
-    _astar_path_finder->set_barrier(pt.x, pt.y, pt.z);
+    for (int idx = 0; idx < (int)cloud.points.size(); idx++)
+    {
+      pt = cloud.points[idx];
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+      valid++;
+      _astar_path_finder->set_barrier(pt.x, pt.y, pt.z);
+    }
   }
+  else
+  {
+    // 非累积：先统计有效点数；太少则不清空，避免清图穿障
+    for (int idx = 0; idx < (int)cloud.points.size(); idx++)
+    {
+      pt = cloud.points[idx];
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+      valid++;
+    }
+
+    if (valid < std::max(1, min_valid_pts))
+    {
+      ROS_WARN_THROTTLE(1.0, "[map] too few valid pts=%d (<%d), keep last occupancy map.",
+                        valid, min_valid_pts);
+      return;
+    }
+
+    _astar_path_finder->resetOccupy();
+    for (int idx = 0; idx < (int)cloud.points.size(); idx++)
+    {
+      pt = cloud.points[idx];
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+      _astar_path_finder->set_barrier(pt.x, pt.y, pt.z);
+    }
+  }
+
+  ROS_DEBUG_THROTTLE(1.0, "[map] local pts=%lu valid=%d accumulate=%d",
+                     (unsigned long)cloud.points.size(), valid, (int)accumulate);
 }
 
 bool trajGeneration()
@@ -482,6 +581,12 @@ void abortTrajServer()
   msg.action          = quadrotor_msgs::PolynomialTrajectory::ACTION_ABORT;
   msg.trajectory_id   = 0;
   _traj_pub.publish(msg);
+}
+
+void shutdownCb(const ros::TimerEvent & /*e*/)
+{
+  ROS_WARN("[node] goal reached, auto shutdown.");
+  ros::shutdown();
 }
 
 bool trajOptimization(const Eigen::MatrixXd &path_in, const Eigen::MatrixXd &path_raw_in)
@@ -958,10 +1063,46 @@ void publishPositionCommand(double t_cur)
   _pos_cmd_pub.publish(cmd);
 }
 
+// 实时 RMSE（用于仿真过程中观察误差收敛）
+void publishRmse(double t_cur)
+{
+  if (!_rmse_pub) return;
+  if (!has_traj) return;
+  if (!has_odom) return;
+
+  // desired position on current trajectory
+  const Vector3d des = getPos(t_cur);
+  if (!des.allFinite()) return;
+
+  const Vector3d err = des - odom_pt;
+  if (!err.allFinite()) return;
+
+  g_rmse_sumsq += err.squaredNorm();
+  g_rmse_n += 1;
+
+  // match calculate_results.py: sqrt(mean(diff^2)) over all samples and 3 dims
+  const double rmse = std::sqrt(g_rmse_sumsq / std::max(1.0, (double)g_rmse_n * 3.0));
+
+  static ros::Time last_pub(0.0);
+  const ros::Time now = ros::Time::now();
+  if ((now - last_pub).toSec() < 0.1)  // 10Hz
+    return;
+  last_pub = now;
+
+  std_msgs::Float64 msg;
+  msg.data = rmse;
+  _rmse_pub.publish(msg);
+
+  ROS_INFO_THROTTLE(0.5, "[RMSE] online=%.4f (N=%lu)", rmse, (unsigned long)g_rmse_n);
+}
+
 int main(int argc, char **argv)
 {
   ros::init(argc, argv, "traj_node");
   ros::NodeHandle nh("~");
+  g_nh_ptr = &nh;
+  nh.param("auto_shutdown_on_goal", g_auto_shutdown_on_goal, true);
+  nh.param("shutdown_delay", g_shutdown_delay_s, 0.5);
 
   nh.param("planning/vel", _Vel, 1.0);
   nh.param("planning/acc", _Acc, 1.0);
@@ -1010,6 +1151,9 @@ int main(int argc, char **argv)
   // *** 关键：直接给 so3_control 的位置指令
   _pos_cmd_pub =
       nh.advertise<quadrotor_msgs::PositionCommand>("/position_cmd", 10);
+
+  // *** 实时 RMSE 发布（便于调参观察）
+  _rmse_pub = nh.advertise<std_msgs::Float64>("rmse", 10);
 
   // set the obstacle map
   _map_lower << -_x_size / 2.0, -_y_size / 2.0, 0.0;

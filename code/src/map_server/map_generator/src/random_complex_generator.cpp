@@ -314,14 +314,16 @@ int main(int argc, char **argv)
   //  RandomMapGenerate(true);
 
    if(choice == 0){
-   //   RandomMapGenerate(false);
-     RandomMapGenerate(true);
-   //  RandomMapGenerate(true);
+     // 生成障碍物点云 + 地面点云，避免 global_ground 为空导致下游解析/时序不稳定
+     RandomMapGenerate(true);   // obstacles -> globalMap_pcd
+     RandomMapGenerate(false);  // ground    -> globalGround_pcd
    }else{
-    FixedMapGenerate();
+     FixedMapGenerate();        // fixed scene -> globalMap_pcd
+     RandomMapGenerate(false);  // also publish a valid ground cloud
    }
    ros::Rate loop_rate(_sense_rate);
-   bool ground_map_swt = true;
+   // 先发布 global_map（障碍物），让下游优先建立 KDTree
+   bool ground_map_swt = false;
    while (ros::ok())
    {
       pubSensedPoints(ground_map_swt);
