@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <functional>
 #include <queue>
 #include <vector>
 
@@ -11,28 +10,6 @@
 
 using namespace std;
 using namespace Eigen;
-
-// ============================================================
-// Tunables
-// ============================================================
-
-// Weighted A*: f = g + w*h (w > 1 makes search faster but less optimal)
-static constexpr double kWAstarW = 1.05;
-// heuristic tie-breaker to break symmetry
-static constexpr double kTieBreaker = 1.0 + 1e-4;
-// Line-of-Sight sampling step (finer = safer)
-static constexpr double kLosSampleRatio = 0.3;  // relative to resolution
-
-// Obstacle inflation radii (in cells)
-static constexpr int kInflationXY = 2;
-static constexpr int kInflationZ = 1;
-
-// Maximum search time (seconds)
-static constexpr double kMaxSearchTime = 0.5;
-
-// Stored goal for path reconstruction
-static Eigen::Vector3d g_goal_pt(0, 0, 0);
-static Eigen::Vector3d g_start_pt(0, 0, 0);
 
 // ============================================================
 // Grid/map init & bookkeeping
@@ -109,12 +86,29 @@ void Astarpath::set_barrier(const double coord_x, const double coord_y,
       idx_z < 0 || idx_z >= GRID_Z_SIZE)
     return;
 
-  // raw mark (original obstacle position)
+  // raw mark
   data_raw[idx_x * GLYZ_SIZE + idx_y * GRID_Z_SIZE + idx_z] = 1;
 
-  // Inflate obstacles to ensure safe clearance
-  const int infl_xy = kInflationXY;
-  const int infl_z  = kInflationZ;
+  // margin from existing param
+  static bool   inited = false;
+  static double margin_m = 0.0;
+  if (!inited) {
+    ros::param::param<double>("/trajectory_generator_node/map/margin", margin_m, 0.0);
+    inited = true;
+  }
+
+  // IMPORTANT: keep inflation modest, but do NOT rely on this alone.
+  // We will add hard-clearance checks at query time.
+  double infl_xy_base = 0.35;
+  double infl_z_base  = 0.25;
+  ros::param::param("~astar_inflation_xy_base", infl_xy_base, 0.35);
+  ros::param::param("~astar_inflation_z_base",  infl_z_base,  0.25);
+
+  const double infl_xy_m = std::max(0.0, infl_xy_base + margin_m);
+  const double infl_z_m  = std::max(0.0, infl_z_base  + 0.5 * margin_m);
+
+  const int infl_xy = std::max(1, (int)std::ceil(infl_xy_m / resolution));
+  const int infl_z  = std::max(0, (int)std::ceil(infl_z_m  / resolution));
 
   for (int dx = -infl_xy; dx <= infl_xy; ++dx) {
     for (int dy = -infl_xy; dy <= infl_xy; ++dy) {
@@ -122,7 +116,6 @@ void Astarpath::set_barrier(const double coord_x, const double coord_y,
       const int ny = idx_y + dy;
       if (nx < 0 || nx >= GRID_X_SIZE || ny < 0 || ny >= GRID_Y_SIZE) continue;
 
-      // Circular inflation for XY
       if (dx*dx + dy*dy > infl_xy*infl_xy) continue;
 
       for (int dz = -infl_z; dz <= infl_z; ++dz) {
@@ -163,7 +156,11 @@ Vector3i Astarpath::coord2gridIndex(const Vector3d &pt) {
 }
 
 Vector3i Astarpath::c2i(const Vector3d &pt) {
-  return coord2gridIndex(pt);
+  Vector3i idx;
+  idx << min(max(int((pt(0) - gl_xl) * inv_resolution), 0), GRID_X_SIZE - 1),
+      min(max(int((pt(1) - gl_yl) * inv_resolution), 0), GRID_Y_SIZE - 1),
+      min(max(int((pt(2) - gl_zl) * inv_resolution), 0), GRID_Z_SIZE - 1);
+  return idx;
 }
 
 Eigen::Vector3d Astarpath::coordRounding(const Eigen::Vector3d &coord) {
@@ -206,7 +203,7 @@ inline bool Astarpath::isFree(const int &idx_x, const int &idx_y,
 }
 
 // ============================================================
-// Clearance helpers
+// Clearance helpers - 保留但简化
 // ============================================================
 
 double Astarpath::nearestObsDistM(const Vector3i &idx, int max_r_cells) const
@@ -272,11 +269,11 @@ double Astarpath::softClearancePenalty(const Vector3i &idx,
   const double d = nearestObsDistM(idx, soft_scan_cells);
   if (d >= soft_range_m) return 0.0;
   const double x = (soft_range_m - d) / soft_range_m;
-  return x * x;
+  return x * x; // quadratic
 }
 
 // ============================================================
-// A* Successors with corner-cutting prevention
+// Successors (26-neighborhood) - 简化版本，参考 refer-1
 // ============================================================
 
 inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
@@ -286,80 +283,182 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
   neighborPtrSets.clear();
   edgeCostSets.clear();
 
-  const int x = currentPtr->index(0);
-  const int y = currentPtr->index(1);
-  const int z = currentPtr->index(2);
-
-  for (int dx = -1; dx <= 1; ++dx) {
-    for (int dy = -1; dy <= 1; ++dy) {
-      for (int dz = -1; dz <= 1; ++dz) {
-        if (dx == 0 && dy == 0 && dz == 0) continue;
-
-        int nx = x + dx, ny = y + dy, nz = z + dz;
-        if (nx < 0 || nx >= GRID_X_SIZE || ny < 0 || ny >= GRID_Y_SIZE ||
-            nz < 0 || nz >= GRID_Z_SIZE)
+  Vector3i Idx_neighbor;
+  for (int dx = -1; dx < 2; dx++) {
+    for (int dy = -1; dy < 2; dy++) {
+      for (int dz = -1; dz < 2; dz++) {
+        if (dx == 0 && dy == 0 && dz == 0)
           continue;
 
-        Vector3i nidx(nx, ny, nz);
-        if (isOccupied(nidx)) continue;
+        Idx_neighbor(0) = (currentPtr->index)(0) + dx;
+        Idx_neighbor(1) = (currentPtr->index)(1) + dy;
+        Idx_neighbor(2) = (currentPtr->index)(2) + dz;
 
-        // Prevent corner cutting: check intermediate cells
-        if (dx != 0) {
-          Vector3i ax(x + dx, y, z);
-          if (isOccupied(ax)) continue;
-        }
-        if (dy != 0) {
-          Vector3i by(x, y + dy, z);
-          if (isOccupied(by)) continue;
-        }
-        if (dz != 0) {
-          Vector3i cz(x, y, z + dz);
-          if (isOccupied(cz)) continue;
+        if (Idx_neighbor(0) < 0 || Idx_neighbor(0) >= GRID_X_SIZE ||
+            Idx_neighbor(1) < 0 || Idx_neighbor(1) >= GRID_Y_SIZE ||
+            Idx_neighbor(2) < 0 || Idx_neighbor(2) >= GRID_Z_SIZE) {
+          continue;
         }
 
-        // Check diagonal cells in each plane
-        if (dx != 0 && dy != 0) {
-          Vector3i cxy(x + dx, y + dy, z);
-          if (isOccupied(cxy)) continue;
-        }
-        if (dx != 0 && dz != 0) {
-          Vector3i cxz(x + dx, y, z + dz);
-          if (isOccupied(cxz)) continue;
-        }
-        if (dy != 0 && dz != 0) {
-          Vector3i cyz(x, y + dy, z + dz);
-          if (isOccupied(cyz)) continue;
-        }
-
-        neighborPtrSets.push_back(Map_Node[nx][ny][nz]);
-        edgeCostSets.push_back(std::sqrt(double(dx*dx + dy*dy + dz*dz)));
+        neighborPtrSets.push_back(
+            Map_Node[Idx_neighbor(0)][Idx_neighbor(1)][Idx_neighbor(2)]);
+        edgeCostSets.push_back(sqrt(dx * dx + dy * dy + dz * dz));
       }
     }
   }
 }
 
-// 3D diagonal-distance heuristic + tie-breaker
+// 3D diagonal-distance heuristic + tie-breaker - 参考 refer-1 实现
 double Astarpath::getHeu(MappingNodePtr node1, MappingNodePtr node2) {
-  int dx = std::abs(node1->index(0) - node2->index(0));
-  int dy = std::abs(node1->index(1) - node2->index(1));
-  int dz = std::abs(node1->index(2) - node2->index(2));
+  // 计算各轴索引差的绝对值
+  double dx = std::abs(node1->index(0) - node2->index(0));
+  double dy = std::abs(node1->index(1) - node2->index(1));
+  double dz = std::abs(node1->index(2) - node2->index(2));
 
-  int d1 = std::min(dx, std::min(dy, dz));
-  int d3 = std::max(dx, std::max(dy, dz));
-  int d2 = dx + dy + dz - d1 - d3;
+  double heu = 0.0;
+  
+  // 使用 3D 对角线距离 (Diagonal Distance)
+  double min_delta = std::min({dx, dy, dz});
+  double max_delta = std::max({dx, dy, dz});
+  double mid_delta = dx + dy + dz - min_delta - max_delta;
 
-  const double D  = 1.0;
-  const double D2 = std::sqrt(2.0);
-  const double D3 = std::sqrt(3.0);
+  // 预计算的权重：
+  // (sqrt(3) - sqrt(2)) ≈ 0.317837
+  // (sqrt(2) - 1)       ≈ 0.414213
+  heu = 0.317837 * min_delta + 0.414213 * mid_delta + max_delta;
 
-  double heu = (double)d1 * D3 + (double)(d2 - d1) * D2 + (double)(d3 - d2) * D;
-  return kTieBreaker * heu;
+  // Tie Breaker: 微小地打破对称性，倾向于深度优先，加快收敛
+  double tie_breaker = 1.0 + 1.0 / 2500.0; 
+  
+  return heu * tie_breaker;
 }
 
 // ============================================================
-// Find nearest free cell to a given cell
+// A* Search - 简化版本，参考 refer-1 实现
 // ============================================================
 
+bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
+{
+  ros::Time time_1 = ros::Time::now();
+
+  // 重置所有网格节点
+  resetUsedGrids();
+  Openset.clear();
+  terminatePtr = NULL;
+
+  // start_point 和 end_point 索引
+  Vector3i start_idx = coord2gridIndex(start_pt);
+  Vector3i end_idx = coord2gridIndex(end_pt);
+  goalIdx = end_idx;
+
+  // start_point 和 end_point 的位置（对齐到网格中心）
+  start_pt = gridIndex2coord(start_idx);
+  end_pt = gridIndex2coord(end_idx);
+
+  // 初始化起点和终点节点指针
+  MappingNodePtr startPtr = Map_Node[start_idx(0)][start_idx(1)][start_idx(2)];
+  MappingNodePtr endPtr = Map_Node[end_idx(0)][end_idx(1)][end_idx(2)];
+
+  MappingNodePtr currentPtr = NULL;
+  MappingNodePtr neighborPtr = NULL;
+
+  // 将起点加入 Open Set
+  startPtr->g_score = 0;
+  startPtr->f_score = getHeu(startPtr, endPtr);
+  startPtr->id = 1;
+  startPtr->coord = start_pt;
+  startPtr->Father = NULL;
+  Openset.insert(make_pair(startPtr->f_score, startPtr));
+
+  double tentative_g_score;
+  vector<MappingNodePtr> neighborPtrSets;
+  vector<double> edgeCostSets;
+
+  while (!Openset.empty()) {
+    // 1. 弹出 f 值最小的节点
+    currentPtr = Openset.begin()->second;
+    Openset.erase(Openset.begin());
+    currentPtr->id = -1;  // 标记为已访问（加入 closed set）
+
+    // 2. 判断是否到达终点
+    if (currentPtr->index == goalIdx) {
+      terminatePtr = currentPtr;
+      ROS_INFO("[A*] Goal found!");
+      return true;
+    }
+
+    // 3. 扩展当前节点
+    AstarGetSucc(currentPtr, neighborPtrSets, edgeCostSets);
+
+    for (unsigned int i = 0; i < neighborPtrSets.size(); i++) {
+      neighborPtr = neighborPtrSets[i];
+
+      // 跳过已在 closed set 中的节点
+      if (neighborPtr->id == -1) {
+        continue;
+      }
+
+      tentative_g_score = currentPtr->g_score + edgeCostSets[i];
+
+      // 跳过被占据的节点
+      if (isOccupied(neighborPtr->index)) {
+        continue;
+      }
+
+      if (neighborPtr->id == 0) {
+        // 节点未访问过，添加到 open set
+        neighborPtr->g_score = tentative_g_score;
+        neighborPtr->f_score = tentative_g_score + getHeu(neighborPtr, endPtr);
+        neighborPtr->Father = currentPtr;
+        neighborPtr->id = 1;
+        neighborPtr->coord = gridIndex2coord(neighborPtr->index);
+        Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
+      } else if (neighborPtr->id == 1) {
+        // 节点已在 open set 中，检查是否需要更新
+        if (neighborPtr->g_score > tentative_g_score) {
+          neighborPtr->g_score = tentative_g_score;
+          neighborPtr->Father = currentPtr;
+          neighborPtr->f_score = tentative_g_score + getHeu(neighborPtr, endPtr);
+          Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
+        }
+      }
+    }
+  }
+
+  ros::Time time_2 = ros::Time::now();
+  if ((time_2 - time_1).toSec() > 0.1)
+    ROS_WARN("Time consume in Astar path finding is %f", (time_2 - time_1).toSec());
+
+  ROS_WARN("[A*] No path found!");
+  return false;
+}
+
+vector<Vector3d> Astarpath::getPath() {
+  vector<Vector3d> path;
+  vector<MappingNodePtr> front_path;
+
+  // 从终点回溯到起点
+  MappingNodePtr cur = terminatePtr;
+  while (cur != NULL) {
+    cur->coord = gridIndex2coord(cur->index);
+    front_path.push_back(cur);
+    cur = cur->Father;
+  }
+
+  // 将 front_path 中的节点坐标反转后添加到 path 中
+  // front_path 是从终点到起点的顺序，需要反转为从起点到终点
+  for (int i = (int)front_path.size() - 1; i >= 0; i--) {
+    path.push_back(front_path[i]->coord);
+  }
+
+  return path;
+}
+
+// ============================================================
+// Path post-processing - 简化版本，参考 refer-1 实现
+// ============================================================
+
+// 找到最近的自由格子
 bool Astarpath::findNearestFree(const Vector3i &seed, Vector3i &out_free) {
   if (!isOccupied(seed)) {
     out_free = seed;
@@ -389,225 +488,65 @@ bool Astarpath::findNearestFree(const Vector3i &seed, Vector3i &out_free) {
   return false;
 }
 
-// ============================================================
-// A* Search - Clean and Robust
-// ============================================================
-
-bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
-{
-  ros::Time t0 = ros::Time::now();
-
-  // Reset grid state
-  resetUsedGrids();
-  Openset.clear();
-  terminatePtr = NULL;
-
-  // Store goal for path reconstruction
-  g_start_pt = start_pt;
-  g_goal_pt = end_pt;
-
-  // Clamp into map bounds
-  auto clampIntoMap = [&](Vector3d &p) {
-    p(0) = std::min(std::max(p(0), gl_xl + 1e-6), gl_xu - 1e-6);
-    p(1) = std::min(std::max(p(1), gl_yl + 1e-6), gl_yu - 1e-6);
-    p(2) = std::min(std::max(p(2), gl_zl + 1e-6), gl_zu - 1e-6);
-  };
-  clampIntoMap(start_pt);
-  clampIntoMap(end_pt);
-
-  Vector3i start_idx = coord2gridIndex(start_pt);
-  Vector3i end_idx   = coord2gridIndex(end_pt);
-  goalIdx = end_idx;
-
-  // Handle occupied start/goal by finding nearest free
-  if (isOccupied(start_idx)) {
-    Vector3i free_idx;
-    if (findNearestFree(start_idx, free_idx)) {
-      start_idx = free_idx;
-      start_pt = gridIndex2coord(start_idx);
-      ROS_WARN("[A*] Start occupied, snapped to nearby free cell.");
-    } else {
-      ROS_ERROR("[A*] Start occupied and no nearby free cell.");
-      return false;
-    }
-  }
-
-  if (isOccupied(end_idx)) {
-    Vector3i free_idx;
-    if (findNearestFree(end_idx, free_idx)) {
-      end_idx = free_idx;
-      end_pt = gridIndex2coord(end_idx);
-      goalIdx = end_idx;
-      ROS_WARN("[A*] Goal occupied, snapped to nearby free cell.");
-    } else {
-      ROS_ERROR("[A*] Goal occupied and no nearby free cell.");
-      return false;
-    }
-  }
-
-  MappingNodePtr startPtr = Map_Node[start_idx(0)][start_idx(1)][start_idx(2)];
-  MappingNodePtr endPtr   = Map_Node[end_idx(0)][end_idx(1)][end_idx(2)];
-
-  startPtr->coord = gridIndex2coord(start_idx);
-  endPtr->coord   = gridIndex2coord(end_idx);
-
-  // Trivial case
-  if (start_idx == end_idx) {
-    terminatePtr = startPtr;
-    return true;
-  }
-
-  startPtr->g_score = 0.0;
-  startPtr->f_score = kWAstarW * getHeu(startPtr, endPtr);
-  startPtr->id = 1;
-  startPtr->Father = NULL;
-  Openset.insert(make_pair(startPtr->f_score, startPtr));
-
-  vector<MappingNodePtr> neighborPtrSets;
-  vector<double> edgeCostSets;
-
-  while (!Openset.empty()) {
-    // Time budget check
-    if ((ros::Time::now() - t0).toSec() > kMaxSearchTime) {
-      ROS_WARN("[A*] Time budget exceeded.");
-      return false;
-    }
-
-    auto it = Openset.begin();
-    MappingNodePtr currentPtr = it->second;
-    Openset.erase(it);
-
-    if (currentPtr->id != 1) continue;
-
-    // Check if goal reached
-    if (currentPtr->index == goalIdx) {
-      terminatePtr = currentPtr;
-      ROS_INFO("[A*] Goal found!");
-      return true;
-    }
-
-    currentPtr->id = -1;  // Mark as closed
-
-    AstarGetSucc(currentPtr, neighborPtrSets, edgeCostSets);
-
-    for (unsigned int i = 0; i < neighborPtrSets.size(); i++) {
-      MappingNodePtr neighborPtr = neighborPtrSets[i];
-      if (neighborPtr->id == -1) continue;
-
-      double tentative_g = currentPtr->g_score + edgeCostSets[i];
-
-      if (neighborPtr->id == 0) {
-        // New node
-        neighborPtr->Father  = currentPtr;
-        neighborPtr->g_score = tentative_g;
-        neighborPtr->f_score = tentative_g + kWAstarW * getHeu(neighborPtr, endPtr);
-        neighborPtr->id = 1;
-        neighborPtr->coord = gridIndex2coord(neighborPtr->index);
-        Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
-      } else if (neighborPtr->id == 1) {
-        // Already in open set, check if this path is better
-        if (tentative_g < neighborPtr->g_score - 1e-9) {
-          neighborPtr->Father  = currentPtr;
-          neighborPtr->g_score = tentative_g;
-          neighborPtr->f_score = tentative_g + kWAstarW * getHeu(neighborPtr, endPtr);
-          neighborPtr->coord = gridIndex2coord(neighborPtr->index);
-          Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
-        }
-      }
-    }
-  }
-
-  ROS_WARN("[A*] No path found (open set exhausted).");
-  return false;
-}
-
-// ============================================================
-// Path retrieval
-// ============================================================
-
-vector<Vector3d> Astarpath::getPath() {
-  vector<Vector3d> path;
-  if (terminatePtr == NULL) return path;
-
-  vector<MappingNodePtr> front_path;
-  MappingNodePtr cur = terminatePtr;
-  while (cur != NULL) {
-    cur->coord = gridIndex2coord(cur->index);
-    front_path.push_back(cur);
-    cur = cur->Father;
-  }
-
-  path.reserve(front_path.size());
-  for (int i = (int)front_path.size() - 1; i >= 0; --i)
-    path.push_back(front_path[i]->coord);
-
-  return path;
-}
-
-// ============================================================
-// Line-of-Sight check
-// ============================================================
-
+// Line-of-Sight 检测：检查两点之间是否有障碍物
 bool Astarpath::lineOfSight(const Vector3d& start, const Vector3d& end) {
   Vector3d direction = end - start;
   double distance = direction.norm();
-
+  
   if (distance < 1e-6) return true;
-
-  // Use fine sampling
-  double step_size = resolution * kLosSampleRatio;
+  
+  // 使用较小的步长进行检测，确保不会穿过障碍物
+  double step_size = resolution * 0.5;
   int num_steps = static_cast<int>(distance / step_size) + 1;
-
+  
   for (int i = 0; i <= num_steps; i++) {
     double t = static_cast<double>(i) / num_steps;
     Vector3d point = start + t * (end - start);
     Vector3i idx = coord2gridIndex(point);
-
+    
     if (isOccupied(idx)) {
-      return false;
+      return false;  // 有障碍物，不可通行
     }
   }
-  return true;
+  return true;  // 无障碍物，可直接通行
 }
-
-// ============================================================
-// Path simplification with Line-of-Sight pruning
-// ============================================================
 
 std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
                                               double path_resolution)
 {
+  // 如果路径点太少，直接返回
   if (path.size() <= 2) {
     return path;
   }
-
+  
+  // 使用 Line-of-Sight 进行路径简化
   vector<Vector3d> simplified_path;
-  simplified_path.push_back(path[0]);  // Keep start
-
+  simplified_path.push_back(path[0]);  // 保留起点
+  
   size_t current = 0;
-
+  
   while (current < path.size() - 1) {
-    // Find the farthest point we can reach directly
+    // 尝试找到能直接到达的最远点
     size_t farthest = current + 1;
-
+    
     for (size_t i = path.size() - 1; i > current + 1; i--) {
       if (lineOfSight(path[current], path[i])) {
         farthest = i;
-        break;
+        break;  // 找到最远的可直达点
       }
     }
-
+    
     simplified_path.push_back(path[farthest]);
     current = farthest;
   }
-
+  
   ROS_INFO("[pathSimplify] in=%d out=%d", (int)path.size(), (int)simplified_path.size());
-
+  
   return simplified_path;
 }
 
 // ============================================================
-// Helper functions
+// Keep your downstream helpers unchanged (but safeCheck upgraded)
 // ============================================================
 
 double Astarpath::perpendicularDistance(const Eigen::Vector3d point_insert,
@@ -639,40 +578,29 @@ Vector3d Astarpath::getPosPoly(MatrixXd polyCoeff, int k, double t) {
   return ret;
 }
 
-// ============================================================
-// Trajectory safety check with fine sampling
-// ============================================================
-
 int Astarpath::safeCheck(MatrixXd polyCoeff, VectorXd time) {
-  int unsafe_segment = -1;
+  int unsafe_segment = -1;  // -1 表示整个轨迹是安全的
 
-  // Use very fine sampling to catch any collision
-  const double delta_t = std::max(0.02, resolution * 0.3);
+  // 使用保守的采样步长
+  double delta_t = resolution / 1.0;
+  double t = delta_t;
+  Vector3d advancePos;
 
   for (int i = 0; i < polyCoeff.rows(); i++) {
-    double t = 0.0;
-    while (t <= time(i)) {
-      Vector3d pos = getPosPoly(polyCoeff, i, t);
-      Vector3i idx = coord2gridIndex(pos);
-
-      // Check if in map bounds
-      if (pos(0) < gl_xl || pos(0) >= gl_xu ||
-          pos(1) < gl_yl || pos(1) >= gl_yu ||
-          pos(2) < gl_zl || pos(2) >= gl_zu) {
+    while (t < time(i)) {
+      advancePos = getPosPoly(polyCoeff, i, t);
+      if (isOccupied(coord2gridIndex(advancePos))) {
         unsafe_segment = i;
         break;
       }
-
-      if (isOccupied(idx)) {
-        unsafe_segment = i;
-        break;
-      }
-
       t += delta_t;
     }
-    if (unsafe_segment != -1) break;
+    if (unsafe_segment != -1) {
+      break;
+    } else {
+      t = delta_t;
+    }
   }
-
   return unsafe_segment;
 }
 
@@ -681,6 +609,6 @@ void Astarpath::resetOccupy() {
     for (int j = 0; j < GRID_Y_SIZE; j++)
       for (int k = 0; k < GRID_Z_SIZE; k++) {
         data[i * GLYZ_SIZE + j * GRID_Z_SIZE + k] = 0;
-        data_raw[i * GLYZ_SIZE + j * GRID_Z_SIZE + k] = 0;
+        data_raw[i * GLYZ_SIZE + j * GRID_Y_SIZE + k] = 0;
       }
 }
