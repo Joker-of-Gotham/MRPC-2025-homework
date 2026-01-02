@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <queue>
 #include <vector>
 
@@ -21,7 +22,6 @@ static constexpr double kWAstarW      = 1.05;
 static constexpr double kTieBreaker   = 1.0 + 1e-4;
 // discourage unnecessary vertical moves
 static constexpr double kZMovePenalty = 1.20;
-
 // RViz goal z=0 fallback
 static constexpr double kMinGoalZUp   = 1e-3;
 
@@ -31,15 +31,15 @@ static constexpr int    kNearestFreeMaxRCells = 12;
 // LoS sampling
 static inline double segStep(double res) { return std::max(0.05, 0.5 * res); }
 
-// Forward cone probing (still useful, but we will additionally use clearance)
-static constexpr double kForwardConeHalfAngleDeg = 30.0; // ±30°
-static constexpr double kForwardLookaheadM       = 6.0;
+// Forward-cone densification (only “front” obstacles densify)
+static constexpr double kForwardConeHalfAngleDeg = 40.0; // ±30°
+static constexpr double kForwardLookaheadM       = 20.0;
 static constexpr int    kForwardRaysYaw          = 3;
 static constexpr int    kForwardRaysPitch        = 2;
 static constexpr double kForwardProbeStepM       = 0.20;
 
 // ============================================================
-// Continuous endpoint anchoring
+// Continuous endpoint anchoring (reduce endpoint rounding mismatch)
 // ============================================================
 namespace {
 static Eigen::Vector3d g_start_cont(0, 0, 0);
@@ -49,7 +49,7 @@ static bool g_reached_goal = false;
 } // namespace
 
 // ============================================================
-// Grid/map init & bookkeeping (match header API)
+// Grid/map init & bookkeeping (match your header API)
 // ============================================================
 
 void Astarpath::begin_grid_map(double _resolution, Vector3d global_xyz_l,
@@ -124,19 +124,17 @@ void Astarpath::set_barrier(const double coord_x, const double coord_y,
   // raw mark
   data_raw[idx_x * GLYZ_SIZE + idx_y * GRID_Z_SIZE + idx_z] = 1;
 
-  // compatibility with your existing param
+  // optional margin from existing param (keeps compatibility with your pipeline)
   static bool   inited = false;
   static double margin_m = 0.0;
-  static double extra_infl_m = 0.10; // NEW: conservative boost to reduce end-segment "擦边"
   if (!inited) {
     ros::param::param<double>("/trajectory_generator_node/map/margin", margin_m, 0.0);
-    ros::param::param<double>("~astar_extra_inflation_m", extra_infl_m, 0.10);
     inited = true;
   }
 
-  // Increase baseline inflation (important for polynomial smoothing safety)
-  const double infl_xy_m = std::max(0.0, 0.38 + margin_m + extra_infl_m);
-  const double infl_z_m  = std::max(0.0, 0.30 + 0.5 * margin_m + 0.5 * extra_infl_m);
+  // modest inflation (XY disk + Z slab); keep consistent with your original implementation
+  const double infl_xy_m = std::max(0.0, 0.30 + margin_m);
+  const double infl_z_m  = std::max(0.0, 0.25 + 0.5 * margin_m);
 
   const int infl_xy = std::max(1, (int)std::ceil(infl_xy_m / resolution));
   const int infl_z  = std::max(0, (int)std::ceil(infl_z_m  / resolution));
@@ -186,7 +184,13 @@ Vector3i Astarpath::coord2gridIndex(const Vector3d &pt) {
   return idx;
 }
 
-Vector3i Astarpath::c2i(const Vector3d &pt) { return coord2gridIndex(pt); }
+Vector3i Astarpath::c2i(const Vector3d &pt) {
+  Vector3i idx;
+  idx << min(max(int((pt(0) - gl_xl) * inv_resolution), 0), GRID_X_SIZE - 1),
+      min(max(int((pt(1) - gl_yl) * inv_resolution), 0), GRID_Y_SIZE - 1),
+      min(max(int((pt(2) - gl_zl) * inv_resolution), 0), GRID_Z_SIZE - 1);
+  return idx;
+}
 
 Eigen::Vector3d Astarpath::coordRounding(const Eigen::Vector3d &coord) {
   return gridIndex2coord(coord2gridIndex(coord));
@@ -229,7 +233,6 @@ inline bool Astarpath::isFree(const int &idx_x, const int &idx_y,
 
 // ============================================================
 // Successors (26-neighborhood + NO corner cutting)
-// + soft clearance penalty to keep away from obstacles
 // ============================================================
 
 inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
@@ -237,33 +240,6 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
                                     vector<double> &edgeCostSets) {
   neighborPtrSets.clear();
   edgeCostSets.clear();
-
-  // soft clearance penalty parameters
-  static bool inited = false;
-  static int  clear_scan_r = 3;       // cells
-  static double clear_w = 0.25;       // weight
-  if (!inited) {
-    ros::param::param("~astar_clear_scan_r", clear_scan_r, 3);
-    ros::param::param("~astar_clear_weight", clear_w, 0.25);
-    inited = true;
-  }
-
-  auto approxClearanceCells = [&](const Vector3i& idx) -> int {
-    if (isOccupied(idx)) return 0;
-    for (int r = 1; r <= clear_scan_r; ++r) {
-      for (int dx = -r; dx <= r; ++dx)
-        for (int dy = -r; dy <= r; ++dy)
-          for (int dz = -r; dz <= r; ++dz) {
-            if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != r) continue;
-            Vector3i q = idx + Vector3i(dx, dy, dz);
-            if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
-                q(1) < 0 || q(1) >= GRID_Y_SIZE ||
-                q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-            if (isOccupied(q)) return r;
-          }
-    }
-    return clear_scan_r + 1;
-  };
 
   const int x = currentPtr->index(0);
   const int y = currentPtr->index(1);
@@ -281,7 +257,7 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
 
         if (isOccupied(nx, ny, nz)) continue;
 
-        // no corner cutting
+        // no corner cutting for diagonals: check involved axis-aligned neighbors
         int ax = x + dx, ay = y, az = z;
         int bx = x, by = y + dy, bz = z;
         int cx = x, cy = y, cz = z + dz;
@@ -290,22 +266,16 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
         if (dy != 0 && isOccupied(bx, by, bz)) continue;
         if (dz != 0 && isOccupied(cx, cy, cz)) continue;
 
+        // for 2-axis diagonals, also check the L-shape corner cell
         if (dx != 0 && dy != 0 && isOccupied(x + dx, y + dy, z)) continue;
         if (dx != 0 && dz != 0 && isOccupied(x + dx, y, z + dz)) continue;
         if (dy != 0 && dz != 0 && isOccupied(x, y + dy, z + dz)) continue;
 
-        MappingNodePtr nb = Map_Node[nx][ny][nz];
-        neighborPtrSets.push_back(nb);
+        neighborPtrSets.push_back(Map_Node[nx][ny][nz]);
 
         double base = std::sqrt(double(dx * dx + dy * dy + dz * dz));
         if (dz != 0) base *= kZMovePenalty;
-
-        // clearance penalty (soft safety margin)
-        const int c = approxClearanceCells(nb->index); // larger is better
-        const double invc = 1.0 / (double)std::max(1, c); // 1.. small
-        const double penalty = clear_w * invc;
-
-        edgeCostSets.push_back(base + penalty);
+        edgeCostSets.push_back(base);
       }
     }
   }
@@ -331,7 +301,6 @@ double Astarpath::getHeu(MappingNodePtr node1, MappingNodePtr node2) {
 
 // ============================================================
 // A* Search (robust: snap start/goal, time budget, best-so-far fallback)
-// + LoS checks with safety radius (buffer) to protect smoothing
 // ============================================================
 
 bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
@@ -341,19 +310,20 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
   Openset.clear();
   terminatePtr = NULL;
 
+  // parameters (private namespace under trajectory_generator_node)
   static bool inited = false;
-  static double max_search_time = 0.12;        // seconds (slightly increased for final clutter)
-  static double analytic_connect_dist = 7.0;   // meters
-  static double los_clearance_m = 0.15;        // NEW: LoS safety buffer (meters)
+  static double max_search_time = 0.08;        // seconds
+  static double analytic_connect_dist = 8.0;   // meters
   if (!inited) {
-    ros::param::param("~astar_max_search_time", max_search_time, 0.12);
-    ros::param::param("~astar_analytic_connect_dist", analytic_connect_dist, 7.0);
-    ros::param::param("~astar_los_clearance_m", los_clearance_m, 0.15);
+    ros::param::param("~astar_max_search_time", max_search_time, 0.08);
+    ros::param::param("~astar_analytic_connect_dist", analytic_connect_dist, 8.0);
     inited = true;
   }
 
+  // RViz may send z=0; keep current altitude
   if (end_pt(2) <= gl_zl + kMinGoalZUp) end_pt(2) = start_pt(2);
 
+  // record continuous endpoints for later anchoring
   g_start_cont = start_pt;
   g_goal_cont  = end_pt;
   g_have_cont  = true;
@@ -371,112 +341,49 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
   Vector3i end_idx   = coord2gridIndex(end_pt);
   goalIdx = end_idx;
 
-  const int r_safe = std::max(0, (int)std::ceil(los_clearance_m / resolution));
-
-  auto insideMap = [&](const Vector3d& p) -> bool {
-    return (p(0) >= gl_xl && p(0) < gl_xu &&
-            p(1) >= gl_yl && p(1) < gl_yu &&
-            p(2) >= gl_zl && p(2) < gl_zu);
-  };
-
-  auto nearOccupied = [&](const Vector3i& idx, int r) -> bool {
-    if (isOccupied(idx)) return true;
-    if (r <= 0) return false;
-    for (int dx = -r; dx <= r; ++dx)
-      for (int dy = -r; dy <= r; ++dy)
-        for (int dz = -r; dz <= r; ++dz) {
-          if (dx == 0 && dy == 0 && dz == 0) continue;
-          Vector3i q = idx + Vector3i(dx, dy, dz);
-          if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
-              q(1) < 0 || q(1) >= GRID_Y_SIZE ||
-              q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-          if (isOccupied(q)) return true;
-        }
-    return false;
-  };
-
-  auto approxClearanceCells = [&](const Vector3i& idx, int rmax) -> int {
-    if (isOccupied(idx)) return 0;
-    for (int r = 1; r <= rmax; ++r) {
-      for (int dx = -r; dx <= r; ++dx)
-        for (int dy = -r; dy <= r; ++dy)
-          for (int dz = -r; dz <= r; ++dz) {
-            if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != r) continue;
-            Vector3i q = idx + Vector3i(dx, dy, dz);
-            if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
-                q(1) < 0 || q(1) >= GRID_Y_SIZE ||
-                q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-            if (isOccupied(q)) return r;
-          }
-    }
-    return rmax + 1;
-  };
-
-  // choose a free cell near seed, preferring larger clearance (important at goal/end segment)
-  auto bestFreeNearby = [&](const Vector3i& seed, Vector3i &out_free) -> bool {
-    if (!isOccupied(seed) && !nearOccupied(seed, r_safe)) { out_free = seed; return true; }
-
-    bool found = false;
-    double best_cost = 1e9;
-    Vector3i best = seed;
-
-    const int rmax = kNearestFreeMaxRCells;
-    const int clear_scan = std::max(3, r_safe + 2);
-
-    for (int r = 1; r <= rmax; ++r) {
-      for (int dx = -r; dx <= r; ++dx)
-        for (int dy = -r; dy <= r; ++dy)
+  // snap a cell index to nearest free cell (critical for robustness)
+  auto nearestFree = [&](const Vector3i& seed, Vector3i &out_free) -> bool {
+    if (!isOccupied(seed)) { out_free = seed; return true; }
+    for (int r = 1; r <= kNearestFreeMaxRCells; ++r) {
+      for (int dx = -r; dx <= r; ++dx) {
+        for (int dy = -r; dy <= r; ++dy) {
           for (int dz = -r; dz <= r; ++dz) {
             if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != r) continue;
             Vector3i q = seed + Vector3i(dx, dy, dz);
             if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
                 q(1) < 0 || q(1) >= GRID_Y_SIZE ||
                 q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-            if (isOccupied(q)) continue;
-            if (nearOccupied(q, r_safe)) continue; // keep some buffer
-
-            const double dist = std::sqrt(double(dx*dx + dy*dy + dz*dz));
-            const int c = approxClearanceCells(q, clear_scan);
-            const double clear_term = 1.0 / (double)std::max(1, c); // smaller is better
-            const double cost = dist + 1.5 * clear_term; // prefer clearance near obstacles
-
-            if (cost < best_cost) {
-              best_cost = cost;
-              best = q;
-              found = true;
-            }
+            if (!isOccupied(q)) { out_free = q; return true; }
           }
-      if (found) break;
+        }
+      }
     }
-
-    if (found) out_free = best;
-    return found;
+    return false;
   };
 
-  // If start/goal are inside/too close to obstacles, snap to a safer nearby cell
-  if (isOccupied(start_idx) || nearOccupied(start_idx, r_safe)) {
+  if (isOccupied(start_idx)) {
     Vector3i sfree;
-    if (bestFreeNearby(start_idx, sfree)) {
+    if (nearestFree(start_idx, sfree)) {
       start_idx = sfree;
       start_pt  = gridIndex2coord(start_idx);
       g_start_cont = start_pt;
-      ROS_WARN("[A*] Start unsafe/occupied, snapped to safer free cell.");
+      ROS_WARN("[A*] Start in occupied cell, snapped to nearest free.");
     } else {
-      ROS_ERROR("[A*] Start unsafe and no nearby safe cell found.");
+      ROS_ERROR("[A*] Start occupied and no nearby free cell found.");
       return false;
     }
   }
 
-  if (isOccupied(end_idx) || nearOccupied(end_idx, r_safe)) {
+  if (isOccupied(end_idx)) {
     Vector3i gfree;
-    if (bestFreeNearby(end_idx, gfree)) {
+    if (nearestFree(end_idx, gfree)) {
       end_idx = gfree;
       end_pt  = gridIndex2coord(end_idx);
       g_goal_cont = end_pt;
       goalIdx = end_idx;
-      ROS_WARN("[A*] Goal unsafe/occupied, snapped to safer free cell.");
+      ROS_WARN("[A*] Goal in occupied cell, snapped to nearest free.");
     } else {
-      ROS_ERROR("[A*] Goal unsafe and no nearby safe cell found.");
+      ROS_ERROR("[A*] Goal occupied and no nearby free cell found.");
       return false;
     }
   }
@@ -495,16 +402,20 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
 
   const double los_step = segStep(resolution);
 
-  // LoS with safety radius (key change vs plain occupancy LoS)
-  auto segmentSafe = [&](const Vector3d& a, const Vector3d& b) -> bool {
+  auto insideMap = [&](const Vector3d& p) -> bool {
+    return (p(0) >= gl_xl && p(0) < gl_xu &&
+            p(1) >= gl_yl && p(1) < gl_yu &&
+            p(2) >= gl_zl && p(2) < gl_zu);
+  };
+
+  auto segmentFree = [&](const Vector3d& a, const Vector3d& b) -> bool {
     const double L = (b - a).norm();
     const int N = std::max(1, (int)std::ceil(L / los_step));
     for (int i = 0; i <= N; ++i) {
       const double tt = (double)i / (double)N;
       const Vector3d p = a + tt * (b - a);
       if (!insideMap(p)) return false;
-      const Vector3i id = coord2gridIndex(p);
-      if (nearOccupied(id, r_safe)) return false;
+      if (isOccupied(coord2gridIndex(p))) return false;
     }
     return true;
   };
@@ -519,16 +430,18 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
   vector<MappingNodePtr> neighborPtrSets;
   vector<double> edgeCostSets;
 
+  // best-so-far (for timeouts)
   MappingNodePtr bestPtr = startPtr;
   double best_h = getHeu(startPtr, endPtr);
 
   while (!Openset.empty()) {
+    // time budget to avoid planner “freeze”
     if ((ros::Time::now() - t0).toSec() > max_search_time) {
       terminatePtr = bestPtr;
       g_reached_goal = (bestPtr && bestPtr->index == goalIdx);
       ROS_WARN("[A*] time budget hit (%.3fs). Return best-so-far (h=%.2f).",
                max_search_time, best_h);
-      return true;
+      return true; // IMPORTANT: return a usable path to avoid system stuck
     }
 
     auto it = Openset.begin();
@@ -548,10 +461,10 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
       return true;
     }
 
-    // analytic connect near goal ONLY if the whole segment is "safe with radius"
+    // analytic connect near goal (LoS)
     const double dist_goal = (endPtr->coord - currentPtr->coord).norm();
     if (dist_goal <= analytic_connect_dist &&
-        segmentSafe(currentPtr->coord, endPtr->coord)) {
+        segmentFree(currentPtr->coord, endPtr->coord)) {
       endPtr->Father  = currentPtr;
       endPtr->g_score = currentPtr->g_score + dist_goal;
       endPtr->f_score = endPtr->g_score;
@@ -591,6 +504,7 @@ bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt) {
     }
   }
 
+  // openset exhausted: still return best-so-far to avoid deadlock
   terminatePtr = bestPtr;
   g_reached_goal = (bestPtr && bestPtr->index == goalIdx);
   ROS_WARN("[A*] openset exhausted. Return best-so-far (h=%.2f).", best_h);
@@ -613,6 +527,7 @@ vector<Vector3d> Astarpath::getPath() {
   for (int i = (int)front_path.size() - 1; i >= 0; --i)
     path.push_back(front_path[i]->coord);
 
+  // anchor endpoints to reduce rounding mismatch
   if (g_have_cont && !path.empty()) {
     path.front() = g_start_cont;
     if (g_reached_goal) path.back() = g_goal_cont;
@@ -621,26 +536,18 @@ vector<Vector3d> Astarpath::getPath() {
 }
 
 // ============================================================
-// Path post-processing:
+// Path post-processing (fast & robust):
 //   - de-dup
-//   - greedy prune using segmentSafe (with radius buffer)
-//   - fillet
-//   - adaptive split by forward probe AND local clearance
-//   - safety repair: if a segment can't be made safe by bisection,
-//                    try lateral offset midpoints to detour around cylinders
+//   - greedy LoS prune
+//   - corner fillet
+//   - forward-cone adaptive split
+//   - enforce consecutive segments are LoS-free (binary split fallback)
 // ============================================================
 
 std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
                                               double path_resolution) {
   if (path.size() < 2) return path;
 
-  static bool inited = false;
-  static double los_clearance_m = 0.15;
-  if (!inited) {
-    ros::param::param("~astar_los_clearance_m", los_clearance_m, 0.15);
-    inited = true;
-  }
-  const int r_safe = std::max(0, (int)std::ceil(los_clearance_m / resolution));
   const double los_step = segStep(resolution);
 
   auto insideMap = [&](const Vector3d& p) -> bool {
@@ -655,80 +562,34 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
     p(2) = std::min(std::max(p(2), gl_zl + 1e-6), gl_zu - 1e-6);
   };
 
-  auto nearOccupied = [&](const Vector3i& idx, int r) -> bool {
-    if (isOccupied(idx)) return true;
-    if (r <= 0) return false;
-    for (int dx = -r; dx <= r; ++dx)
-      for (int dy = -r; dy <= r; ++dy)
-        for (int dz = -r; dz <= r; ++dz) {
-          if (dx == 0 && dy == 0 && dz == 0) continue;
-          Vector3i q = idx + Vector3i(dx, dy, dz);
-          if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
-              q(1) < 0 || q(1) >= GRID_Y_SIZE ||
-              q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-          if (isOccupied(q)) return true;
-        }
-    return false;
-  };
-
-  auto segmentSafe = [&](const Vector3d& a, const Vector3d& b) -> bool {
+  auto segmentFree = [&](const Vector3d& a, const Vector3d& b) -> bool {
     const double L = (b - a).norm();
     const int N = std::max(1, (int)std::ceil(L / los_step));
     for (int i = 0; i <= N; ++i) {
       const double t = (double)i / (double)N;
       const Vector3d p = a + t * (b - a);
       if (!insideMap(p)) return false;
-      const Vector3i id = coord2gridIndex(p);
-      if (nearOccupied(id, r_safe)) return false;
+      if (isOccupied(coord2gridIndex(p))) return false;
     }
     return true;
   };
 
-  auto approxClearanceCells = [&](const Vector3i& idx, int rmax) -> int {
-    if (isOccupied(idx)) return 0;
-    for (int r = 1; r <= rmax; ++r) {
-      for (int dx = -r; dx <= r; ++dx)
-        for (int dy = -r; dy <= r; ++dy)
-          for (int dz = -r; dz <= r; ++dz) {
-            if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != r) continue;
-            Vector3i q = idx + Vector3i(dx, dy, dz);
-            if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
-                q(1) < 0 || q(1) >= GRID_Y_SIZE ||
-                q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-            if (isOccupied(q)) return r;
-          }
-    }
-    return rmax + 1;
-  };
-
-  auto improveClearance = [&](Vector3d p) -> Vector3d {
+  auto sanitizePoint = [&](Vector3d p) -> Vector3d {
     clampIntoMap(p);
     Vector3i idx = coord2gridIndex(p);
-    if (!nearOccupied(idx, r_safe)) return p;
+    if (!isOccupied(idx)) return p;
 
-    // search small neighborhood for a safer point
-    Vector3i best = idx;
-    int best_c = 0;
-    double best_d = 1e9;
-
-    const int scan = std::max(2, r_safe + 1);
-    for (int dx = -scan; dx <= scan; ++dx)
-      for (int dy = -scan; dy <= scan; ++dy)
-        for (int dz = -scan; dz <= scan; ++dz) {
+    // tiny local nudge
+    for (int dx = -1; dx <= 1; ++dx)
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dz = -1; dz <= 1; ++dz) {
           Vector3i q = idx + Vector3i(dx, dy, dz);
           if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
               q(1) < 0 || q(1) >= GRID_Y_SIZE ||
               q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-          if (isOccupied(q)) continue;
-          if (nearOccupied(q, r_safe)) continue;
-
-          int c = approxClearanceCells(q, std::max(3, r_safe + 2));
-          double d = Vector3d(dx,dy,dz).norm();
-          if (c > best_c || (c == best_c && d < best_d)) {
-            best_c = c; best_d = d; best = q;
-          }
+          if (!isOccupied(q)) return gridIndex2coord(q);
         }
-    return gridIndex2coord(best);
+    return gridIndex2coord(idx);
   };
 
   // 1) de-dup
@@ -740,17 +601,16 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   }
   if (clean.size() < 2) return clean;
 
-  // anchor endpoints and improve clearance (prevents end-segment squeeze)
+  // anchor endpoints
   if (g_have_cont) {
-    clean.front() = improveClearance(g_start_cont);
-    if (g_reached_goal) clean.back() = improveClearance(g_goal_cont);
-    else clean.back() = improveClearance(clean.back());
+    clean.front() = sanitizePoint(g_start_cont);
+    if (g_reached_goal) clean.back() = sanitizePoint(g_goal_cont);
   } else {
-    clean.front() = improveClearance(clean.front());
-    clean.back()  = improveClearance(clean.back());
+    clean.front() = sanitizePoint(clean.front());
+    clean.back()  = sanitizePoint(clean.back());
   }
 
-  // 2) greedy prune using segmentSafe (NOT plain LoS)
+  // 2) greedy LoS prune
   std::vector<Vector3d> pruned;
   pruned.reserve(clean.size());
   pruned.push_back(clean.front());
@@ -758,13 +618,13 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   while (i + 1 < clean.size()) {
     size_t best = i + 1;
     for (size_t j = clean.size() - 1; j > i; --j) {
-      if (segmentSafe(clean[i], clean[j])) { best = j; break; }
+      if (segmentFree(clean[i], clean[j])) { best = j; break; }
     }
     pruned.push_back(clean[best]);
     i = best;
   }
 
-  // 3) corner fillet (light, but keep safety)
+  // 3) corner fillet (light)
   const double fillet_ratio = 0.25;
   const double min_corner = std::max(0.8, 2.0 * path_resolution);
 
@@ -791,18 +651,18 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
         (Lab > min_corner) && (Lbc > min_corner)) {
       const double d1 = std::max(min_corner * 0.5, fillet_ratio * Lab);
       const double d2 = std::max(min_corner * 0.5, fillet_ratio * Lbc);
-      Vector3d b1 = improveClearance(b - u * std::min(d1, 0.45 * Lab));
-      Vector3d b2 = improveClearance(b + v * std::min(d2, 0.45 * Lbc));
+      Vector3d b1 = sanitizePoint(b - u * std::min(d1, 0.45 * Lab));
+      Vector3d b2 = sanitizePoint(b + v * std::min(d2, 0.45 * Lbc));
 
-      if (segmentSafe(fillet.back(), b1) &&
-          segmentSafe(b1, b2) &&
-          segmentSafe(b2, c)) {
+      if (segmentFree(fillet.back(), b1) &&
+          segmentFree(b1, b2) &&
+          segmentFree(b2, c)) {
         fillet.push_back(b1);
         fillet.push_back(b2);
         continue;
       }
     }
-    fillet.push_back(improveClearance(b));
+    fillet.push_back(b);
   }
   fillet.push_back(pruned.back());
 
@@ -838,7 +698,7 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
       for (double s = kForwardProbeStepM; s <= kForwardLookaheadM; s += kForwardProbeStepM) {
         Vector3d q = p0 + s * rd;
         if (!insideMap(q)) { best = std::min(best, s); break; }
-        if (nearOccupied(coord2gridIndex(q), r_safe)) { best = std::min(best, s); break; }
+        if (isOccupied(coord2gridIndex(q))) { best = std::min(best, s); break; }
       }
     }
     return best;
@@ -851,55 +711,11 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
   const double kMinSplitLenM = std::max(0.8, 2.5 * path_resolution);
 
   std::vector<Vector3d> out;
-  out.reserve(fillet.size() * 3);
+  out.reserve(fillet.size() * 2);
   out.push_back(fillet.front());
 
-  // try to find a detour midpoint when segment cannot satisfy segmentSafe
-  auto findDetourMid = [&](const Vector3d& a, const Vector3d& b) -> bool {
-    Vector3d d = b - a;
-    const double L = d.norm();
-    if (L < 1e-6) return false;
-    d /= L;
-
-    Vector3d up(0,0,1);
-    if (std::fabs(d.dot(up)) > 0.95) up = Vector3d(0,1,0);
-    Vector3d right = d.cross(up).normalized();
-    Vector3d up2 = right.cross(d).normalized();
-
-    const Vector3d mid0 = 0.5 * (a + b);
-
-    // candidate offsets (meters)
-    const double radii[] = {0.6, 1.0, 1.4};
-    const double angles_deg[] = {0, 45, 90, 135, 180, 225, 270, 315};
-
-    for (double r : radii) {
-      for (double angd : angles_deg) {
-        double ang = angd * std::acos(-1.0) / 180.0;
-        Vector3d off = std::cos(ang) * right + std::sin(ang) * up2;
-        Vector3d mid = improveClearance(mid0 + r * off);
-        if (segmentSafe(a, mid) && segmentSafe(mid, b)) {
-          if ((mid - out.back()).norm() > 1e-4) out.push_back(mid);
-          return true;
-        }
-      }
-      // also try vertical nudges
-      Vector3d midu = improveClearance(mid0 + r * up2);
-      if (segmentSafe(a, midu) && segmentSafe(midu, b)) {
-        if ((midu - out.back()).norm() > 1e-4) out.push_back(midu);
-        return true;
-      }
-      Vector3d midd = improveClearance(mid0 - r * up2);
-      if (segmentSafe(a, midd) && segmentSafe(midd, b)) {
-        if ((midd - out.back()).norm() > 1e-4) out.push_back(midd);
-        return true;
-      }
-    }
-    return false;
-  };
-
-  // push target with safety repair
   auto pushChecked = [&](const Vector3d& target) {
-    Vector3d p = improveClearance(target);
+    Vector3d p = sanitizePoint(target);
 
     struct Seg { Vector3d a,b; int depth; };
     std::vector<Seg> st;
@@ -907,30 +723,17 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
 
     while (!st.empty()) {
       Seg seg = st.back(); st.pop_back();
-
-      if (segmentSafe(seg.a, seg.b)) {
+      if (segmentFree(seg.a, seg.b)) {
         if ((seg.b - out.back()).norm() > 1e-4) out.push_back(seg.b);
         continue;
       }
-
-      // if bisection depth is high, try detour midpoints (critical for cylinder obstacles)
-      if (seg.depth >= 6) {
-        if (findDetourMid(seg.a, seg.b)) {
-          // after inserting mid, we will continue with seg.b next via recursion-like split
-          st.push_back({out.back(), seg.b, seg.depth + 1});
-          continue;
-        }
-      }
-
-      if (seg.depth >= 10) {
-        // final fallback: accept split midpoints (will at least avoid huge jumps)
-        Vector3d mid = improveClearance(0.5 * (seg.a + seg.b));
+      if (seg.depth >= 8) {
+        Vector3d mid = sanitizePoint(0.5 * (seg.a + seg.b));
         if ((mid - out.back()).norm() > 1e-4) out.push_back(mid);
         if ((seg.b - out.back()).norm() > 1e-4) out.push_back(seg.b);
         continue;
       }
-
-      Vector3d mid = improveClearance(0.5 * (seg.a + seg.b));
+      Vector3d mid = sanitizePoint(0.5 * (seg.a + seg.b));
       st.push_back({mid, seg.b, seg.depth + 1});
       st.push_back({seg.a, mid, seg.depth + 1});
     }
@@ -946,17 +749,10 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
 
     const double obs = forwardObstacleDist(a0, d);
 
-    // also adapt by local clearance at a0 (side obstacles)
-    const int ccell = approxClearanceCells(coord2gridIndex(a0), std::max(4, r_safe + 2));
-    const double clearance_m = std::max(0.0, (double)ccell * resolution);
-
     double max_len = base_mid;
     if (obs <= 1.0) max_len = base_near;
     else if (obs <= 3.0) max_len = base_mid;
     else max_len = base_open;
-
-    if (clearance_m < 0.8) max_len = std::min(max_len, base_near);
-    else if (clearance_m < 1.2) max_len = std::min(max_len, base_mid);
 
     max_len = std::max(max_len, kMinSplitLenM);
 
@@ -978,15 +774,14 @@ std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
     if ((out[ii] - final_out.back()).norm() > 1e-4) final_out.push_back(out[ii]);
   }
 
-  ROS_WARN("[pathSimplify] in=%d clean=%d pruned=%d fillet=%d out=%d (r_safe=%d)",
-           (int)path.size(), (int)clean.size(), (int)pruned.size(), (int)fillet.size(),
-           (int)final_out.size(), r_safe);
+  ROS_WARN("[pathSimplify] in=%d clean=%d pruned=%d fillet=%d out=%d",
+           (int)path.size(), (int)clean.size(), (int)pruned.size(), (int)fillet.size(), (int)final_out.size());
 
   return final_out;
 }
 
 // ============================================================
-// helpers used by your downstream modules (unchanged)
+// Keep your downstream helpers unchanged
 // ============================================================
 
 double Astarpath::perpendicularDistance(const Eigen::Vector3d point_insert,
@@ -1020,7 +815,7 @@ Vector3d Astarpath::getPosPoly(MatrixXd polyCoeff, int k, double t) {
 int Astarpath::safeCheck(MatrixXd polyCoeff, VectorXd time) {
   int unsafe_segment = -1;
 
-  // slightly finer sampling makes collision detection consistent
+  // finer sampling reduces "overshoot through obstacle" misses
   const double delta_t = std::max(std::min(resolution * 0.5, 0.10), 0.03);
 
   double t = delta_t;
