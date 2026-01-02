@@ -412,6 +412,13 @@ void trajOptimization(Eigen::MatrixXd path)
     iteration++;
     regen_flag = true;
 
+    // 安全检查：确保 unsafe_segment 有效
+    if (unsafe_segment < 0 || unsafe_segment >= path.rows() - 1)
+    {
+      ROS_WARN("[trajOptimization] Invalid unsafe_segment=%d, breaking.", unsafe_segment);
+      break;
+    }
+
     // Create new path with one more point
     repath = MatrixXd::Zero(path.rows() + 1, path.cols());
 
@@ -422,10 +429,37 @@ void trajOptimization(Eigen::MatrixXd path)
     }
 
     // Insert middle point between unsafe_segment and unsafe_segment+1
-    // The unsafe segment is the segment from path[unsafe_segment] to path[unsafe_segment+1]
-    repath.row(unsafe_segment + 1) = (path.row(unsafe_segment) + path.row(unsafe_segment + 1)) / 2.0;
+    // 使用更智能的中间点：考虑安全性
+    Eigen::Vector3d p1 = path.row(unsafe_segment).transpose();
+    Eigen::Vector3d p2 = path.row(unsafe_segment + 1).transpose();
+    Eigen::Vector3d mid_point = (p1 + p2) / 2.0;
+    
+    // 尝试找到一个安全的中间点
+    Eigen::Vector3i mid_idx = _astar_path_finder->coord2gridIndex(mid_point);
+    if (_astar_path_finder->is_occupy(mid_idx))
+    {
+      // 如果中间点被占用，尝试在周围找一个安全的点
+      bool found_safe = false;
+      for (int dz = 1; dz <= 3 && !found_safe; ++dz)
+      {
+        Eigen::Vector3d test_point = mid_point + Eigen::Vector3d(0, 0, dz * 0.3);
+        Eigen::Vector3i test_idx = _astar_path_finder->coord2gridIndex(test_point);
+        if (!_astar_path_finder->is_occupy(test_idx))
+        {
+          mid_point = test_point;
+          found_safe = true;
+        }
+      }
+      if (!found_safe)
+      {
+        ROS_WARN("[trajOptimization] Cannot find safe middle point, using original.");
+      }
+    }
+    
+    repath.row(unsafe_segment + 1) = mid_point.transpose();
 
-    ROS_INFO("[trajOptimization] Adding middle point at segment %d", unsafe_segment);
+    ROS_INFO("[trajOptimization] Adding middle point at segment %d: (%.2f, %.2f, %.2f)", 
+             unsafe_segment, mid_point(0), mid_point(1), mid_point(2));
 
     // Copy remaining points (shift by 1)
     for (int i = unsafe_segment + 1; i < path.rows(); i++)
@@ -433,7 +467,7 @@ void trajOptimization(Eigen::MatrixXd path)
       repath.row(i + 1) = path.row(i);
     }
 
-    // Ensure the last point is still the original goal
+    // 关键：确保最后一个点始终是原始目标
     repath.row(repath.rows() - 1) = original_goal.transpose();
 
     path      = repath;

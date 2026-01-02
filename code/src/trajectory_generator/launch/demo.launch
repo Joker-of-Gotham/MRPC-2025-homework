@@ -26,26 +26,33 @@
     <remap from="~local_pointcloud" to="/pcl_render_node/local_pointcloud"/>
     <remap from="~odom"             to="/visual_slam/odom"/>
 
-    <!-- 轨迹规划参数 -->
-    <param name="planning/vel"       value="3.0"/>
-    <param name="planning/acc"       value="2.0"/>
+    <!-- 轨迹规划参数 - 适中的速度和加速度 -->
+    <param name="planning/vel"       value="2.5"/>
+    <param name="planning/acc"       value="1.5"/>
     <param name="planning/dev_order" value="3"/>
     <param name="planning/min_order" value="3"/>
 
     <!-- 可视化与地图参数 -->
     <param name="vis/vis_traj_width" value="0.07"/>
-    <param name="map/margin"         value="0.0"/>
-    <param name="map/resolution"     value="0.2"/>
+    <param name="map/margin"         value="0.15"/>
+    <param name="map/resolution"     value="0.15"/>
     <param name="map/x_size"         value="$(arg map_size_x)"/>
     <param name="map/y_size"         value="$(arg map_size_y)"/>
     <param name="map/z_size"         value="$(arg map_size_z)"/>
 
     <!-- 重规划参数 -->
-    <param name="replanning/thresh_replan"    value="1.5" type="double"/>
-    <param name="replanning/thresh_no_replan" value="2.0" type="double"/>
+    <param name="replanning/thresh_replan"    value="1.0" type="double"/>
+    <param name="replanning/thresh_no_replan" value="1.5" type="double"/>
 
     <!-- A* 路径简化分辨率 -->
-    <param name="path/resolution" value="0.2"/>
+    <param name="path/resolution" value="0.15"/>
+    
+    <!-- A* 搜索参数 -->
+    <param name="astar_max_search_time"     value="0.30"/>
+    <param name="astar_hard_clearance_xy"   value="2"/>
+    <param name="astar_hard_clearance_z"    value="0"/>
+    <param name="astar_soft_clearance_range_m" value="0.50"/>
+    <param name="astar_soft_clearance_weight"  value="1.2"/>
 
     <!-- 作业里 demox 标志 -->
     <param name="planning/demox" value="0"/>

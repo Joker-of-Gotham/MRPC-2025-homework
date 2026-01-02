@@ -198,31 +198,23 @@ void SO3ControlNodelet::position_cmd_callback(
                              cmd->acceleration.z);
 
   /**
-   * 控制器增益参数 (PD控制器)
+   * 控制器增益参数 - 优化版本
    * 
-   * 线性化平动误差模型：m e¨ = -k_x e - k_v e˙
-   * k_x: 位置误差增益 (比例P)，控制位置跟踪的响应速度
-   * k_v: 速度误差增益 (微分D/阻尼)，抑制超调和振荡
-   *
-   * 调参策略：
-   * - 增大 kx 可加快响应，但过大会导致超调和振荡
-   * - 增大 kv 可提高阻尼，减少超调和抖动
-   * - 对于临界阻尼: kv ≈ 2*sqrt(kx*mass)
-   *
-   * 经过优化的参数：
-   * - XY方向使用较高增益以提高轨迹跟踪精度和响应速度
-   * - Z方向使用稍低增益以保持高度稳定
-   * - 阻尼比略大于1（过阻尼），确保无超调和振荡
+   * 综合多个参考实现后的调参结果：
+   * - 使用适中的增益值避免振荡和抖动
+   * - 保持足够的阻尼比确保稳定性
+   * - Z方向略高增益以保持高度稳定
+   * 
+   * 与 gains_hummingbird.yaml 保持一致
    */
   
-  // 高性能参数：平衡响应速度和稳定性
-  // XY方向: 高增益用于精确跟踪
-  const double kx_xy = 20.0;  // 位置增益
-  const double kv_xy = 9.0;   // 速度增益 (阻尼)
+  // 位置增益 - 适中值，平衡响应速度和稳定性
+  const double kx_xy = 5.5;
+  const double kx_z = 6.0;
   
-  // Z方向: 略保守以确保稳定悬停
-  const double kx_z = 15.0;
-  const double kv_z = 8.0;
+  // 速度增益 - 提供良好阻尼
+  const double kv_xy = 3.5;
+  const double kv_z = 4.0;
 
   kx_ = Eigen::Vector3d(kx_xy, kx_xy, kx_z);
   kv_ = Eigen::Vector3d(kv_xy, kv_xy, kv_z);

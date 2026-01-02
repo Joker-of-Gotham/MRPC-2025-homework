@@ -1,17 +1,16 @@
-# Optimized Gains for Hummingbird - Improved stability and tracking
+# Optimized Gains for Hummingbird - Balance between stability and performance
 # 
-# 位置增益(pos): 控制位置误差的响应速度
-# 速度增益(vel): 提供阻尼，抑制超调和振荡
-# 旋转增益(rot): 控制姿态误差的响应
-# 角速度增益(ang): 提供角速度阻尼
-#
-# 调参原则:
-# - 增大pos/vel可提高轨迹跟踪精度，但过大会导致振荡
-# - rot/ang控制姿态响应，影响飞行稳定性
-# - 对于临界阻尼: vel ≈ 2*sqrt(pos*mass)
+# 参考多个成功实现后的综合调参
+# - 位置增益适中，避免过度振荡
+# - 速度增益提供足够阻尼
+# - 旋转/角速度增益保持稳定姿态控制
 #
 gains:
-  pos: {x: 20.0, y: 20.0, z: 15.0}
-  vel: {x: 9.0, y: 9.0, z: 8.0}
-  rot: {x: 1.8, y: 1.8, z: 1.0}
-  ang: {x: 0.15, y: 0.15, z: 0.10}
+  # 位置增益 - 适中值，避免过度响应导致振荡
+  pos: {x: 5.5, y: 5.5, z: 6.0}
+  # 速度增益 - 提供良好阻尼
+  vel: {x: 3.5, y: 3.5, z: 4.0}
+  # 旋转增益 - 稳定的姿态响应
+  rot: {x: 1.5, y: 1.5, z: 0.5}
+  # 角速度增益 - 抑制角速度振荡
+  ang: {x: 0.10, y: 0.10, z: 0.05}

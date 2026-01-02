@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <queue>
 #include <vector>
 
@@ -10,6 +11,48 @@
 
 using namespace std;
 using namespace Eigen;
+
+// ============================================================
+// Tunables (with ROS params override)
+// ============================================================
+
+// Weighted A*: f = g + w*h
+static constexpr double kWAstarWDefault = 1.02;
+// heuristic tie-breaker
+static constexpr double kTieBreaker = 1.0 + 1e-4;
+// discourage unnecessary vertical moves
+static constexpr double kZMovePenalty = 1.25;
+// additional penalty when the move introduces vertical component after horizontal
+static constexpr double kZTurnPenaltyWDefault = 0.6;
+// generic turning penalty weight
+static constexpr double kTurnPenaltyWDefault  = 0.35;
+// prefer staying near nominal altitude (start z)
+static constexpr double kZDeviationWDefault   = 0.15;
+// RViz goal z=0 fallback
+static constexpr double kMinGoalZUp = 1e-3;
+
+// start/goal snap search radius (cells)
+static constexpr int kNearestFreeMaxRCells = 12;
+
+// LoS sampling
+static inline double segStep(double res) { return std::max(0.05, 0.5 * res); }
+
+// forward cone probing (used only for adaptive split; keep)
+static constexpr double kForwardConeHalfAngleDeg = 40.0;
+static constexpr double kForwardLookaheadM       = 20.0;
+static constexpr int    kForwardRaysYaw          = 3;
+static constexpr int    kForwardRaysPitch        = 2;
+static constexpr double kForwardProbeStepM       = 0.20;
+
+// ============================================================
+// Continuous endpoint anchoring
+// ============================================================
+namespace {
+static Eigen::Vector3d g_start_cont(0, 0, 0);
+static Eigen::Vector3d g_goal_cont(0, 0, 0);
+static bool g_have_cont = false;
+static bool g_reached_goal = false;
+} // namespace
 
 // ============================================================
 // Grid/map init & bookkeeping
@@ -203,9 +246,20 @@ inline bool Astarpath::isFree(const int &idx_x, const int &idx_y,
 }
 
 // ============================================================
-// Clearance helpers - 保留但简化
+// Clearance helpers (hard/soft)
 // ============================================================
 
+namespace {
+
+// clamp helper
+inline double clampd(double v, double a, double b) {
+  return std::min(std::max(v, a), b);
+}
+
+} // namespace
+
+// compute nearest obstacle distance (meters) within a capped neighborhood.
+// if none found within max_r_cells => return (max_r_cells + 1) * resolution
 double Astarpath::nearestObsDistM(const Vector3i &idx, int max_r_cells) const
 {
   if (isOccupied(idx)) return 0.0;
@@ -273,7 +327,7 @@ double Astarpath::softClearancePenalty(const Vector3i &idx,
 }
 
 // ============================================================
-// Successors (26-neighborhood) - 简化版本，参考 refer-1
+// Successors (26-neighborhood + NO corner cutting + hard clearance)
 // ============================================================
 
 inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
@@ -283,161 +337,483 @@ inline void Astarpath::AstarGetSucc(MappingNodePtr currentPtr,
   neighborPtrSets.clear();
   edgeCostSets.clear();
 
-  Vector3i Idx_neighbor;
-  for (int dx = -1; dx < 2; dx++) {
-    for (int dy = -1; dy < 2; dy++) {
-      for (int dz = -1; dz < 2; dz++) {
-        if (dx == 0 && dy == 0 && dz == 0)
+  // hard clearance params
+  int hard_xy_cells = 1, hard_z_cells = 0;
+  ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
+  ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+
+  const int x = currentPtr->index(0);
+  const int y = currentPtr->index(1);
+  const int z = currentPtr->index(2);
+
+  for (int dx = -1; dx <= 1; ++dx) {
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dz = -1; dz <= 1; ++dz) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+
+        int nx = x + dx, ny = y + dy, nz = z + dz;
+        if (nx < 0 || nx >= GRID_X_SIZE || ny < 0 || ny >= GRID_Y_SIZE ||
+            nz < 0 || nz >= GRID_Z_SIZE)
           continue;
 
-        Idx_neighbor(0) = (currentPtr->index)(0) + dx;
-        Idx_neighbor(1) = (currentPtr->index)(1) + dy;
-        Idx_neighbor(2) = (currentPtr->index)(2) + dz;
+        Vector3i nidx(nx, ny, nz);
+        if (isOccupied(nidx)) continue;
+        if (isTooCloseHard(nidx, hard_xy_cells, hard_z_cells)) continue;
 
-        if (Idx_neighbor(0) < 0 || Idx_neighbor(0) >= GRID_X_SIZE ||
-            Idx_neighbor(1) < 0 || Idx_neighbor(1) >= GRID_Y_SIZE ||
-            Idx_neighbor(2) < 0 || Idx_neighbor(2) >= GRID_Z_SIZE) {
-          continue;
+        // no corner cutting (also with clearance)
+        Vector3i ax(x + dx, y, z);
+        Vector3i bx(x, y + dy, z);
+        Vector3i cx(x, y, z + dz);
+
+        if (dx != 0 && (isOccupied(ax) || isTooCloseHard(ax, hard_xy_cells, hard_z_cells))) continue;
+        if (dy != 0 && (isOccupied(bx) || isTooCloseHard(bx, hard_xy_cells, hard_z_cells))) continue;
+        if (dz != 0 && (isOccupied(cx) || isTooCloseHard(cx, hard_xy_cells, hard_z_cells))) continue;
+
+        if (dx != 0 && dy != 0) {
+          Vector3i cxy(x + dx, y + dy, z);
+          if (isOccupied(cxy) || isTooCloseHard(cxy, hard_xy_cells, hard_z_cells)) continue;
+        }
+        if (dx != 0 && dz != 0) {
+          Vector3i cxz(x + dx, y, z + dz);
+          if (isOccupied(cxz) || isTooCloseHard(cxz, hard_xy_cells, hard_z_cells)) continue;
+        }
+        if (dy != 0 && dz != 0) {
+          Vector3i cyz(x, y + dy, z + dz);
+          if (isOccupied(cyz) || isTooCloseHard(cyz, hard_xy_cells, hard_z_cells)) continue;
         }
 
-        neighborPtrSets.push_back(
-            Map_Node[Idx_neighbor(0)][Idx_neighbor(1)][Idx_neighbor(2)]);
-        edgeCostSets.push_back(sqrt(dx * dx + dy * dy + dz * dz));
+        neighborPtrSets.push_back(Map_Node[nx][ny][nz]);
+
+        double base = std::sqrt(double(dx * dx + dy * dy + dz * dz));
+        if (dz != 0) base *= kZMovePenalty;
+        edgeCostSets.push_back(base);
       }
     }
   }
 }
 
-// 3D diagonal-distance heuristic + tie-breaker - 参考 refer-1 实现
+// 3D diagonal-distance heuristic + tie-breaker
 double Astarpath::getHeu(MappingNodePtr node1, MappingNodePtr node2) {
-  // 计算各轴索引差的绝对值
-  double dx = std::abs(node1->index(0) - node2->index(0));
-  double dy = std::abs(node1->index(1) - node2->index(1));
-  double dz = std::abs(node1->index(2) - node2->index(2));
+  int dx = std::abs(node1->index(0) - node2->index(0));
+  int dy = std::abs(node1->index(1) - node2->index(1));
+  int dz = std::abs(node1->index(2) - node2->index(2));
 
-  double heu = 0.0;
-  
-  // 使用 3D 对角线距离 (Diagonal Distance)
-  double min_delta = std::min({dx, dy, dz});
-  double max_delta = std::max({dx, dy, dz});
-  double mid_delta = dx + dy + dz - min_delta - max_delta;
+  int d1 = std::min(dx, std::min(dy, dz));
+  int d3 = std::max(dx, std::max(dy, dz));
+  int d2 = dx + dy + dz - d1 - d3;
 
-  // 预计算的权重：
-  // (sqrt(3) - sqrt(2)) ≈ 0.317837
-  // (sqrt(2) - 1)       ≈ 0.414213
-  heu = 0.317837 * min_delta + 0.414213 * mid_delta + max_delta;
+  const double D  = 1.0;
+  const double D2 = std::sqrt(2.0);
+  const double D3 = std::sqrt(3.0);
 
-  // Tie Breaker: 微小地打破对称性，倾向于深度优先，加快收敛
-  double tie_breaker = 1.0 + 1.0 / 2500.0; 
-  
-  return heu * tie_breaker;
+  double heu = (double)d1 * D3 + (double)(d2 - d1) * D2 + (double)(d3 - d2) * D;
+  return kTieBreaker * heu;
 }
 
 // ============================================================
-// A* Search - 简化版本，参考 refer-1 实现
+// A* Search (robust + angle/clearance penalties + safe fallback)
 // ============================================================
 
 bool Astarpath::AstarSearch(Vector3d start_pt, Vector3d end_pt)
 {
-  ros::Time time_1 = ros::Time::now();
+  ros::Time t0 = ros::Time::now();
 
-  // 重置所有网格节点
   resetUsedGrids();
   Openset.clear();
   terminatePtr = NULL;
 
-  // start_point 和 end_point 索引
+  // params
+  static bool inited = false;
+  static double max_search_time = 0.20;        // seconds
+  static double analytic_connect_dist = 8.0;   // meters
+  static double w_astar = kWAstarWDefault;
+  static double turn_w  = kTurnPenaltyWDefault;
+  static double zturn_w = kZTurnPenaltyWDefault;
+  static double zdev_w  = kZDeviationWDefault;
+
+  // soft clearance
+  static double soft_range_m = 0.60;
+  static int    soft_scan_cells = 6;
+  static double soft_w = 0.80;
+
+  // min acceptable clearance for “execute a partial path”
+  static double min_exec_clearance_m = 0.35;
+
+  // hard clearance neighborhood
+  static int hard_xy_cells = 1;
+  static int hard_z_cells  = 0;
+
+  if (!inited) {
+    ros::param::param("~astar_max_search_time", max_search_time, 0.20);
+    ros::param::param("~astar_analytic_connect_dist", analytic_connect_dist, 8.0);
+    ros::param::param("~astar_w", w_astar, kWAstarWDefault);
+
+    ros::param::param("~astar_turn_penalty_w", turn_w, kTurnPenaltyWDefault);
+    ros::param::param("~astar_zturn_penalty_w", zturn_w, kZTurnPenaltyWDefault);
+    ros::param::param("~astar_zdev_penalty_w", zdev_w, kZDeviationWDefault);
+
+    ros::param::param("~astar_soft_clearance_range_m", soft_range_m, 0.60);
+    ros::param::param("~astar_soft_clearance_scan_cells", soft_scan_cells, 6);
+    ros::param::param("~astar_soft_clearance_weight", soft_w, 0.80);
+
+    ros::param::param("~astar_min_exec_clearance_m", min_exec_clearance_m, 0.35);
+
+    ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
+    ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+
+    inited = true;
+  } else {
+    // allow runtime tuning
+    ros::param::get("~astar_max_search_time", max_search_time);
+    ros::param::get("~astar_w", w_astar);
+    ros::param::get("~astar_turn_penalty_w", turn_w);
+    ros::param::get("~astar_zturn_penalty_w", zturn_w);
+    ros::param::get("~astar_zdev_penalty_w", zdev_w);
+    ros::param::get("~astar_soft_clearance_range_m", soft_range_m);
+    ros::param::get("~astar_soft_clearance_scan_cells", soft_scan_cells);
+    ros::param::get("~astar_soft_clearance_weight", soft_w);
+    ros::param::get("~astar_min_exec_clearance_m", min_exec_clearance_m);
+    ros::param::get("~astar_hard_clearance_xy", hard_xy_cells);
+    ros::param::get("~astar_hard_clearance_z", hard_z_cells);
+  }
+
+  // RViz may send z=0; keep current altitude
+  if (end_pt(2) <= gl_zl + kMinGoalZUp) end_pt(2) = start_pt(2);
+
+  // record continuous endpoints
+  g_start_cont = start_pt;
+  g_goal_cont  = end_pt;
+  g_have_cont  = true;
+  g_reached_goal = false;
+
+  auto clampIntoMap = [&](Vector3d &p) {
+    p(0) = std::min(std::max(p(0), gl_xl + 1e-6), gl_xu - 1e-6);
+    p(1) = std::min(std::max(p(1), gl_yl + 1e-6), gl_yu - 1e-6);
+    p(2) = std::min(std::max(p(2), gl_zl + 1e-6), gl_zu - 1e-6);
+  };
+  clampIntoMap(start_pt);
+  clampIntoMap(end_pt);
+
   Vector3i start_idx = coord2gridIndex(start_pt);
-  Vector3i end_idx = coord2gridIndex(end_pt);
+  Vector3i end_idx   = coord2gridIndex(end_pt);
   goalIdx = end_idx;
 
-  // start_point 和 end_point 的位置（对齐到网格中心）
-  start_pt = gridIndex2coord(start_idx);
-  end_pt = gridIndex2coord(end_idx);
+  // LoS / inside
+  const double los_step = segStep(resolution);
 
-  // 初始化起点和终点节点指针
-  MappingNodePtr startPtr = Map_Node[start_idx(0)][start_idx(1)][start_idx(2)];
-  MappingNodePtr endPtr = Map_Node[end_idx(0)][end_idx(1)][end_idx(2)];
+  auto insideMap = [&](const Vector3d& p) -> bool {
+    return (p(0) >= gl_xl && p(0) < gl_xu &&
+            p(1) >= gl_yl && p(1) < gl_yu &&
+            p(2) >= gl_zl && p(2) < gl_zu);
+  };
 
-  MappingNodePtr currentPtr = NULL;
-  MappingNodePtr neighborPtr = NULL;
+  auto pointSafe = [&](const Vector3d& p) -> bool {
+    if (!insideMap(p)) return false;
+    Vector3i idx = coord2gridIndex(p);
+    if (isOccupied(idx)) return false;
+    if (isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return false;
+    return true;
+  };
 
-  // 将起点加入 Open Set
-  startPtr->g_score = 0;
-  startPtr->f_score = getHeu(startPtr, endPtr);
-  startPtr->id = 1;
-  startPtr->coord = start_pt;
-  startPtr->Father = NULL;
-  Openset.insert(make_pair(startPtr->f_score, startPtr));
+  auto segmentSafe = [&](const Vector3d& a, const Vector3d& b) -> bool {
+    const double L = (b - a).norm();
+    const int N = std::max(1, (int)std::ceil(L / los_step));
+    for (int i = 0; i <= N; ++i) {
+      const double t = (double)i / (double)N;
+      const Vector3d p = a + t * (b - a);
+      if (!pointSafe(p)) return false;
+    }
+    return true;
+  };
 
-  double tentative_g_score;
-  vector<MappingNodePtr> neighborPtrSets;
-  vector<double> edgeCostSets;
-
-  while (!Openset.empty()) {
-    // 1. 弹出 f 值最小的节点
-    currentPtr = Openset.begin()->second;
-    Openset.erase(Openset.begin());
-    currentPtr->id = -1;  // 标记为已访问（加入 closed set）
-
-    // 2. 判断是否到达终点
-    if (currentPtr->index == goalIdx) {
-      terminatePtr = currentPtr;
-      ROS_INFO("[A*] Goal found!");
+  // ==========================================================
+  // Better nearest-free: choose the “best” by clearance + dz preference
+  // ==========================================================
+  auto nearestFreeBest = [&](const Vector3i& seed, Vector3i &out_free) -> bool {
+    // if already safe
+    if (!isOccupied(seed) && !isTooCloseHard(seed, hard_xy_cells, hard_z_cells)) {
+      out_free = seed;
       return true;
     }
 
-    // 3. 扩展当前节点
+    const double seed_z = gridIndex2coord(seed)(2);
+
+    bool found = false;
+    double bestScore = 1e100;
+    Vector3i bestIdx = seed;
+
+    const int R = kNearestFreeMaxRCells;
+    for (int r = 1; r <= R; ++r) {
+      for (int dx = -r; dx <= r; ++dx) {
+        for (int dy = -r; dy <= r; ++dy) {
+          for (int dz = -r; dz <= r; ++dz) {
+            if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != r) continue;
+
+            Vector3i q = seed + Vector3i(dx, dy, dz);
+            if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
+                q(1) < 0 || q(1) >= GRID_Y_SIZE ||
+                q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
+
+            if (isOccupied(q)) continue;
+            if (isTooCloseHard(q, hard_xy_cells, hard_z_cells)) continue;
+
+            const double dcell = std::sqrt((double)(dx*dx + dy*dy + dz*dz));
+            const double qz = gridIndex2coord(q)(2);
+            const double dzm = std::fabs(qz - seed_z);
+
+            // clearance term (prefer large)
+            const double clr = nearestObsDistM(q, soft_scan_cells); // capped
+            const double invc = 1.0 / std::max(0.05, clr);
+
+            // score: small distance, small dz, large clearance
+            const double score = 1.0 * dcell + 2.0 * (dzm / std::max(1e-6, resolution)) + 2.5 * invc;
+
+            if (score < bestScore) {
+              bestScore = score;
+              bestIdx = q;
+              found = true;
+            }
+          }
+        }
+      }
+      if (found) break;
+    }
+
+    if (!found) return false;
+    out_free = bestIdx;
+    return true;
+  };
+
+  // snap start / goal
+  if (isOccupied(start_idx) || isTooCloseHard(start_idx, hard_xy_cells, hard_z_cells)) {
+    Vector3i sfree;
+    if (nearestFreeBest(start_idx, sfree)) {
+      start_idx = sfree;
+      start_pt  = gridIndex2coord(start_idx);
+      g_start_cont = start_pt;
+      ROS_WARN("[A*] Start unsafe, snapped to best nearby safe cell.");
+    } else {
+      ROS_ERROR("[A*] Start unsafe and no nearby safe cell found.");
+      return false;
+    }
+  }
+
+  if (isOccupied(end_idx) || isTooCloseHard(end_idx, hard_xy_cells, hard_z_cells)) {
+    Vector3i gfree;
+    if (nearestFreeBest(end_idx, gfree)) {
+      end_idx = gfree;
+      end_pt  = gridIndex2coord(end_idx);
+      g_goal_cont = end_pt;
+      goalIdx = end_idx;
+      ROS_WARN("[A*] Goal unsafe, snapped to best nearby safe cell.");
+    } else {
+      ROS_ERROR("[A*] Goal unsafe and no nearby safe cell found.");
+      return false;
+    }
+  }
+
+  MappingNodePtr startPtr = Map_Node[start_idx(0)][start_idx(1)][start_idx(2)];
+  MappingNodePtr endPtr   = Map_Node[end_idx(0)][end_idx(1)][end_idx(2)];
+
+  startPtr->coord = gridIndex2coord(start_idx);
+  endPtr->coord   = gridIndex2coord(end_idx);
+
+  if (start_idx == end_idx) {
+    terminatePtr = startPtr;
+    g_reached_goal = true;
+    return true;
+  }
+
+  // adapt time budget in dense area: if start clearance small, allow more time
+  {
+    const double start_clr = nearestObsDistM(start_idx, soft_scan_cells);
+    if (start_clr < 0.8) {
+      max_search_time = std::min(0.50, max_search_time * 2.0);
+    }
+  }
+
+  const double nominal_z = startPtr->coord(2);
+
+  startPtr->g_score = 0.0;
+  startPtr->f_score = startPtr->g_score + w_astar * getHeu(startPtr, endPtr);
+  startPtr->id = 1;
+  startPtr->Father = NULL;
+
+  Openset.insert(make_pair(startPtr->f_score, startPtr));
+
+  vector<MappingNodePtr> neighborPtrSets;
+  vector<double> edgeCostSets;
+
+  // best-so-far for diagnostic only (do NOT blindly execute it)
+  MappingNodePtr bestPtr = startPtr;
+  double best_h = getHeu(startPtr, endPtr);
+
+  auto computeMoveDir = [&](MappingNodePtr a, MappingNodePtr b) -> Vector3d {
+    Vector3d d = (gridIndex2coord(b->index) - gridIndex2coord(a->index));
+    double n = d.norm();
+    if (n < 1e-6) return Vector3d::Zero();
+    return d / n;
+  };
+
+  // safe fallback: find a nearby “retreat” point with maximum clearance
+  auto pickRetreat = [&](const Vector3i& seed) -> Vector3i {
+    Vector3i best = seed;
+    double bestClr = nearestObsDistM(seed, soft_scan_cells);
+
+    for (int r = 1; r <= 6; ++r) {
+      for (int dx = -r; dx <= r; ++dx)
+        for (int dy = -r; dy <= r; ++dy)
+          for (int dz = -std::min(2, r); dz <= std::min(2, r); ++dz) {
+            Vector3i q = seed + Vector3i(dx, dy, dz);
+            if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
+                q(1) < 0 || q(1) >= GRID_Y_SIZE ||
+                q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
+            if (isOccupied(q) || isTooCloseHard(q, hard_xy_cells, hard_z_cells)) continue;
+
+            // prefer small dz
+            const double dzm = std::fabs(gridIndex2coord(q)(2) - gridIndex2coord(seed)(2));
+            if (dzm > 0.8) continue;
+
+            const double clr = nearestObsDistM(q, soft_scan_cells);
+            if (clr > bestClr + 1e-6) {
+              // require segment safety
+              if (segmentSafe(gridIndex2coord(seed), gridIndex2coord(q))) {
+                best = q;
+                bestClr = clr;
+              }
+            }
+          }
+    }
+    return best;
+  };
+
+  while (!Openset.empty()) {
+    // time budget - 延长搜索时间，确保尽可能找到完整路径
+    const double elapsed = (ros::Time::now() - t0).toSec();
+    if (elapsed > max_search_time * 2.0) {
+      // 只有在搜索时间非常长时才中断
+      // 优先使用 bestPtr（最接近目标的点），而不是 retreat
+      const double clr = nearestObsDistM(bestPtr->index, soft_scan_cells);
+      
+      if (bestPtr->index == goalIdx) {
+        terminatePtr = bestPtr;
+        g_reached_goal = true;
+        return true;
+      }
+
+      // 关键修复：即使没有完全到达目标，也要向目标方向前进
+      // 不要使用 retreat 机制，这会导致无人机往回飞
+      terminatePtr = bestPtr;
+      // 重要：设置 g_reached_goal = true，确保终点被保留
+      // 虽然没有完全到达，但路径应该朝向目标
+      g_reached_goal = true;  
+      ROS_WARN("[A*] time budget hit. Using best-so-far toward goal (clr=%.2f, h=%.2f).", clr, best_h);
+      return true;
+    }
+
+    auto it = Openset.begin();
+    const double popped_f = it->first;
+    MappingNodePtr currentPtr = it->second;
+    Openset.erase(it);
+
+    if (currentPtr->id != 1) continue;
+    if (popped_f > currentPtr->f_score + 1e-6) continue;
+
+    const double hcur = getHeu(currentPtr, endPtr);
+    if (hcur < best_h) { best_h = hcur; bestPtr = currentPtr; }
+
+    if (currentPtr->index == goalIdx) {
+      terminatePtr = currentPtr;
+      g_reached_goal = true;
+      return true;
+    }
+
+    // analytic connect near goal
+    const double dist_goal = (endPtr->coord - currentPtr->coord).norm();
+    if (dist_goal <= analytic_connect_dist && segmentSafe(currentPtr->coord, endPtr->coord)) {
+      endPtr->Father  = currentPtr;
+      endPtr->g_score = currentPtr->g_score + dist_goal;
+      endPtr->f_score = endPtr->g_score;
+      endPtr->id = 1;
+      terminatePtr = endPtr;
+      g_reached_goal = true;
+      return true;
+    }
+
+    currentPtr->id = -1;
+
     AstarGetSucc(currentPtr, neighborPtrSets, edgeCostSets);
 
     for (unsigned int i = 0; i < neighborPtrSets.size(); i++) {
-      neighborPtr = neighborPtrSets[i];
+      MappingNodePtr neighborPtr = neighborPtrSets[i];
+      if (neighborPtr->id == -1) continue;
 
-      // 跳过已在 closed set 中的节点
-      if (neighborPtr->id == -1) {
-        continue;
+      // base move cost
+      double g_inc = edgeCostSets[i];
+
+      // soft clearance penalty
+      g_inc += soft_w * softClearancePenalty(neighborPtr->index, soft_range_m, soft_scan_cells);
+
+      // altitude deviation penalty (keep z stable unless needed)
+      g_inc += zdev_w * std::fabs(gridIndex2coord(neighborPtr->index)(2) - nominal_z);
+
+      // turning penalty (angle-aware)
+      if (currentPtr->Father != NULL) {
+        Vector3d d_prev = computeMoveDir(currentPtr->Father, currentPtr);
+        Vector3d d_new  = computeMoveDir(currentPtr, neighborPtr);
+        if (d_prev.norm() > 1e-6 && d_new.norm() > 1e-6) {
+          double cosang = clampd(d_prev.dot(d_new), -1.0, 1.0);
+          double turn_cost = (1.0 - cosang); // 0..2
+          g_inc += turn_w * turn_cost;
+
+          // extra penalty if “horizontal then vertical” or “vertical then horizontal”
+          const double prev_v = std::fabs(d_prev(2));
+          const double new_v  = std::fabs(d_new(2));
+          g_inc += zturn_w * std::fabs(new_v - prev_v);
+        }
       }
 
-      tentative_g_score = currentPtr->g_score + edgeCostSets[i];
-
-      // 跳过被占据的节点
-      if (isOccupied(neighborPtr->index)) {
-        continue;
-      }
+      double tentative_g_score = currentPtr->g_score + g_inc;
 
       if (neighborPtr->id == 0) {
-        // 节点未访问过，添加到 open set
+        neighborPtr->Father  = currentPtr;
         neighborPtr->g_score = tentative_g_score;
-        neighborPtr->f_score = tentative_g_score + getHeu(neighborPtr, endPtr);
-        neighborPtr->Father = currentPtr;
+        neighborPtr->f_score = tentative_g_score + w_astar * getHeu(neighborPtr, endPtr);
         neighborPtr->id = 1;
         neighborPtr->coord = gridIndex2coord(neighborPtr->index);
         Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
       } else if (neighborPtr->id == 1) {
-        // 节点已在 open set 中，检查是否需要更新
-        if (neighborPtr->g_score > tentative_g_score) {
+        if (tentative_g_score + 1e-9 < neighborPtr->g_score) {
+          neighborPtr->Father  = currentPtr;
           neighborPtr->g_score = tentative_g_score;
-          neighborPtr->Father = currentPtr;
-          neighborPtr->f_score = tentative_g_score + getHeu(neighborPtr, endPtr);
+          neighborPtr->f_score = tentative_g_score + w_astar * getHeu(neighborPtr, endPtr);
+          neighborPtr->coord = gridIndex2coord(neighborPtr->index);
           Openset.insert(make_pair(neighborPtr->f_score, neighborPtr));
         }
       }
     }
   }
 
-  ros::Time time_2 = ros::Time::now();
-  if ((time_2 - time_1).toSec() > 0.1)
-    ROS_WARN("Time consume in Astar path finding is %f", (time_2 - time_1).toSec());
-
-  ROS_WARN("[A*] No path found!");
+  // openset exhausted: 使用 bestPtr，确保向目标方向前进
+  // 不使用 retreat，避免无人机往回飞
+  if (bestPtr != startPtr) {
+    terminatePtr = bestPtr;
+    // 即使没有完全到达目标，也标记为 true 以保留终点方向
+    g_reached_goal = true;
+    ROS_WARN("[A*] openset exhausted. Using best-so-far toward goal (h=%.2f).", best_h);
+    return true;
+  }
+  
+  // 如果完全没有进展，返回失败
+  ROS_ERROR("[A*] openset exhausted with no progress.");
   return false;
 }
 
 vector<Vector3d> Astarpath::getPath() {
   vector<Vector3d> path;
-  vector<MappingNodePtr> front_path;
+  if (terminatePtr == NULL) return path;
 
-  // 从终点回溯到起点
+  vector<MappingNodePtr> front_path;
   MappingNodePtr cur = terminatePtr;
   while (cur != NULL) {
     cur->coord = gridIndex2coord(cur->index);
@@ -445,104 +821,386 @@ vector<Vector3d> Astarpath::getPath() {
     cur = cur->Father;
   }
 
-  // 将 front_path 中的节点坐标反转后添加到 path 中
-  // front_path 是从终点到起点的顺序，需要反转为从起点到终点
-  for (int i = (int)front_path.size() - 1; i >= 0; i--) {
+  path.reserve(front_path.size());
+  for (int i = (int)front_path.size() - 1; i >= 0; --i)
     path.push_back(front_path[i]->coord);
-  }
 
+  // anchor endpoints - 关键修复：始终保留起点和目标点
+  if (g_have_cont && !path.empty()) {
+    path.front() = g_start_cont;
+    // 始终将终点设置为目标点，确保轨迹朝向目标
+    // 即使 A* 没有完全到达目标，也要保持目标方向
+    path.back() = g_goal_cont;
+  }
+  
+  ROS_INFO("[getPath] path size = %d, start=(%.2f,%.2f,%.2f), goal=(%.2f,%.2f,%.2f)",
+           (int)path.size(), 
+           path.empty() ? 0 : path.front()(0), path.empty() ? 0 : path.front()(1), path.empty() ? 0 : path.front()(2),
+           path.empty() ? 0 : path.back()(0), path.empty() ? 0 : path.back()(1), path.empty() ? 0 : path.back()(2));
+           
   return path;
 }
 
 // ============================================================
-// Path post-processing - 简化版本，参考 refer-1 实现
+// Path post-processing (STRICT safety, no “force insert colliding point”)
 // ============================================================
-
-// 找到最近的自由格子
-bool Astarpath::findNearestFree(const Vector3i &seed, Vector3i &out_free) {
-  if (!isOccupied(seed)) {
-    out_free = seed;
-    return true;
-  }
-
-  const int maxR = 10;
-  for (int r = 1; r <= maxR; ++r) {
-    for (int dx = -r; dx <= r; ++dx) {
-      for (int dy = -r; dy <= r; ++dy) {
-        for (int dz = -r; dz <= r; ++dz) {
-          if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != r) continue;
-
-          Vector3i q = seed + Vector3i(dx, dy, dz);
-          if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
-              q(1) < 0 || q(1) >= GRID_Y_SIZE ||
-              q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
-
-          if (!isOccupied(q)) {
-            out_free = q;
-            return true;
-          }
-        }
-      }
-    }
-  }
-  return false;
-}
-
-// Line-of-Sight 检测：检查两点之间是否有障碍物
-bool Astarpath::lineOfSight(const Vector3d& start, const Vector3d& end) {
-  Vector3d direction = end - start;
-  double distance = direction.norm();
-  
-  if (distance < 1e-6) return true;
-  
-  // 使用较小的步长进行检测，确保不会穿过障碍物
-  double step_size = resolution * 0.5;
-  int num_steps = static_cast<int>(distance / step_size) + 1;
-  
-  for (int i = 0; i <= num_steps; i++) {
-    double t = static_cast<double>(i) / num_steps;
-    Vector3d point = start + t * (end - start);
-    Vector3i idx = coord2gridIndex(point);
-    
-    if (isOccupied(idx)) {
-      return false;  // 有障碍物，不可通行
-    }
-  }
-  return true;  // 无障碍物，可直接通行
-}
 
 std::vector<Vector3d> Astarpath::pathSimplify(const vector<Vector3d> &path,
                                               double path_resolution)
 {
-  // 如果路径点太少，直接返回
-  if (path.size() <= 2) {
-    return path;
+  if (path.size() < 2) return path;
+
+  // params (runtime)
+  int hard_xy_cells = 1, hard_z_cells = 0;
+  ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
+  ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+
+  double max_climb_deg = 20.0; // limit near-vertical segments
+  ros::param::param("~astar_max_climb_deg", max_climb_deg, 20.0);
+  const double tan_max_climb = std::tan(max_climb_deg * M_PI / 180.0);
+
+  const double los_step = segStep(resolution);
+
+  auto insideMap = [&](const Vector3d& p) -> bool {
+    return (p(0) >= gl_xl && p(0) < gl_xu &&
+            p(1) >= gl_yl && p(1) < gl_yu &&
+            p(2) >= gl_zl && p(2) < gl_zu);
+  };
+
+  auto clampIntoMap = [&](Vector3d &p) {
+    p(0) = std::min(std::max(p(0), gl_xl + 1e-6), gl_xu - 1e-6);
+    p(1) = std::min(std::max(p(1), gl_yl + 1e-6), gl_yu - 1e-6);
+    p(2) = std::min(std::max(p(2), gl_zl + 1e-6), gl_zu - 1e-6);
+  };
+
+  auto pointSafe = [&](const Vector3d& p) -> bool {
+    if (!insideMap(p)) return false;
+    Vector3i idx = coord2gridIndex(p);
+    if (isOccupied(idx)) return false;
+    if (isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return false;
+    return true;
+  };
+
+  auto segmentSafe = [&](const Vector3d& a, const Vector3d& b) -> bool {
+    const double L = (b - a).norm();
+    const int N = std::max(1, (int)std::ceil(L / los_step));
+    for (int i = 0; i <= N; ++i) {
+      const double t = (double)i / (double)N;
+      const Vector3d p = a + t * (b - a);
+      if (!pointSafe(p)) return false;
+    }
+    return true;
+  };
+
+  // smarter sanitize: local best by clearance
+  auto sanitizePoint = [&](Vector3d p) -> Vector3d {
+    clampIntoMap(p);
+    if (pointSafe(p)) return p;
+
+    Vector3i idx = coord2gridIndex(p);
+    Vector3i best = idx;
+    double bestClr = -1.0;
+
+    for (int dx = -2; dx <= 2; ++dx)
+      for (int dy = -2; dy <= 2; ++dy)
+        for (int dz = -1; dz <= 1; ++dz) {
+          Vector3i q = idx + Vector3i(dx, dy, dz);
+          if (q(0) < 0 || q(0) >= GRID_X_SIZE ||
+              q(1) < 0 || q(1) >= GRID_Y_SIZE ||
+              q(2) < 0 || q(2) >= GRID_Z_SIZE) continue;
+          if (isOccupied(q) || isTooCloseHard(q, hard_xy_cells, hard_z_cells)) continue;
+          const double clr = nearestObsDistM(q, 6);
+          if (clr > bestClr) { bestClr = clr; best = q; }
+        }
+
+    return gridIndex2coord(best);
+  };
+
+  // 1) de-dup
+  std::vector<Vector3d> clean;
+  clean.reserve(path.size());
+  clean.push_back(path.front());
+  for (size_t i = 1; i < path.size(); ++i) {
+    if ((path[i] - clean.back()).norm() > 1e-4) clean.push_back(path[i]);
+  }
+  if (clean.size() < 2) return clean;
+
+  // anchor endpoints - 始终保留起点和目标点
+  if (g_have_cont) {
+    clean.front() = sanitizePoint(g_start_cont);
+    // 关键：始终保留目标点，确保轨迹朝向目标
+    clean.back() = sanitizePoint(g_goal_cont);
+  } else {
+    clean.front() = sanitizePoint(clean.front());
+    clean.back()  = sanitizePoint(clean.back());
   }
   
-  // 使用 Line-of-Sight 进行路径简化
-  vector<Vector3d> simplified_path;
-  simplified_path.push_back(path[0]);  // 保留起点
-  
-  size_t current = 0;
-  
-  while (current < path.size() - 1) {
-    // 尝试找到能直接到达的最远点
-    size_t farthest = current + 1;
-    
-    for (size_t i = path.size() - 1; i > current + 1; i--) {
-      if (lineOfSight(path[current], path[i])) {
-        farthest = i;
-        break;  // 找到最远的可直达点
+  // 保存原始目标点用于最后确保终点正确
+  const Vector3d original_goal = clean.back();
+
+  // 2) greedy LoS prune (strict)
+  std::vector<Vector3d> pruned;
+  pruned.reserve(clean.size());
+  pruned.push_back(clean.front());
+  size_t i = 0;
+  while (i + 1 < clean.size()) {
+    size_t best = i + 1;
+    for (size_t j = clean.size() - 1; j > i; --j) {
+      if (segmentSafe(clean[i], clean[j])) { best = j; break; }
+    }
+    pruned.push_back(clean[best]);
+    i = best;
+  }
+
+  // 3) light corner fillet (only if all involved segments safe)
+  const double fillet_ratio = 0.25;
+  const double min_corner = std::max(0.8, 2.0 * path_resolution);
+
+  std::vector<Vector3d> fillet;
+  fillet.reserve(pruned.size() * 2);
+  fillet.push_back(pruned.front());
+  for (size_t k = 1; k + 1 < pruned.size(); ++k) {
+    const Vector3d a = fillet.back();
+    const Vector3d b = pruned[k];
+    const Vector3d c = pruned[k + 1];
+
+    const Vector3d ab = b - a;
+    const Vector3d bc = c - b;
+    const double Lab = ab.norm();
+    const double Lbc = bc.norm();
+    if (Lab < 1e-6 || Lbc < 1e-6) continue;
+
+    const Vector3d u = ab / Lab;
+    const Vector3d v = bc / Lbc;
+    const double cosang = std::max(-1.0, std::min(1.0, u.dot(v)));
+    const double ang = std::acos(cosang);
+
+    if (ang > (25.0 * M_PI / 180.0) && (Lab > min_corner) && (Lbc > min_corner)) {
+      const double d1 = std::max(min_corner * 0.5, fillet_ratio * Lab);
+      const double d2 = std::max(min_corner * 0.5, fillet_ratio * Lbc);
+      Vector3d b1 = sanitizePoint(b - u * std::min(d1, 0.45 * Lab));
+      Vector3d b2 = sanitizePoint(b + v * std::min(d2, 0.45 * Lbc));
+
+      if (segmentSafe(fillet.back(), b1) &&
+          segmentSafe(b1, b2) &&
+          segmentSafe(b2, c)) {
+        fillet.push_back(b1);
+        fillet.push_back(b2);
+        continue;
       }
     }
-    
-    simplified_path.push_back(path[farthest]);
-    current = farthest;
+    fillet.push_back(b);
   }
-  
-  ROS_INFO("[pathSimplify] in=%d out=%d", (int)path.size(), (int)simplified_path.size());
-  
-  return simplified_path;
+  fillet.push_back(pruned.back());
+
+  // forward-cone obstacle probing (use strict pointSafe)
+  auto forwardObstacleDist = [&](const Vector3d& p0, const Vector3d& dir_unit) -> double {
+    Vector3d d = dir_unit;
+    if (d.norm() < 1e-6) return 0.0;
+
+    Vector3d up(0, 0, 1);
+    if (std::fabs(d.dot(up)) > 0.95) up = Vector3d(0, 1, 0);
+    Vector3d right = d.cross(up);
+    if (right.norm() < 1e-6) right = Vector3d(1, 0, 0);
+    right.normalize();
+    Vector3d up2 = right.cross(d).normalized();
+
+    const double th = kForwardConeHalfAngleDeg * M_PI / 180.0;
+    const double tth = std::tan(th);
+
+    std::vector<Vector3d> dirs;
+    dirs.reserve((2 * kForwardRaysYaw + 1) * (2 * kForwardRaysPitch + 1));
+    for (int iy = -kForwardRaysYaw; iy <= kForwardRaysYaw; ++iy) {
+      for (int ip = -kForwardRaysPitch; ip <= kForwardRaysPitch; ++ip) {
+        Vector3d dd = d
+          + (double)iy * (tth / std::max(1, kForwardRaysYaw)) * right
+          + (double)ip * (tth / std::max(1, kForwardRaysPitch)) * up2;
+        dd.normalize();
+        dirs.push_back(dd);
+      }
+    }
+
+    double best = kForwardLookaheadM + 1.0;
+    for (const auto& rd : dirs) {
+      for (double s = kForwardProbeStepM; s <= kForwardLookaheadM; s += kForwardProbeStepM) {
+        Vector3d q = p0 + s * rd;
+        if (!insideMap(q)) { best = std::min(best, s); break; }
+        if (!pointSafe(q)) { best = std::min(best, s); break; }
+      }
+    }
+    return best;
+  };
+
+  // adaptive split lengths
+  const double base_open = std::min(6.0, std::max(3.5, 10.0 * path_resolution));
+  const double base_mid  = std::min(3.0, std::max(2.0,  6.0 * path_resolution));
+  const double base_near = std::min(1.5, std::max(1.0,  3.5 * path_resolution));
+  const double kMinSplitLenM = std::max(0.8, 2.5 * path_resolution);
+
+  std::vector<Vector3d> out;
+  out.reserve(fillet.size() * 2);
+  out.push_back(fillet.front());
+
+  // detour search: try to find a safe intermediate point around obstacle
+  auto findDetour = [&](const Vector3d& a, const Vector3d& b, Vector3d& det) -> bool {
+    Vector3d mid = 0.5 * (a + b);
+    Vector3d d = (b - a);
+    double L = d.norm();
+    if (L < 1e-6) return false;
+    d /= L;
+
+    Vector3d perp(-d.y(), d.x(), 0.0);
+    if (perp.norm() < 1e-6) perp = Vector3d(1, 0, 0);
+    perp.normalize();
+
+    // try offsets (left/right) and slight vertical offsets
+    double bestClr = -1.0;
+    Vector3d bestP;
+
+    for (int step = 1; step <= 8; ++step) {
+      double r = step * std::max(0.6, 2.0 * resolution);
+      for (int sgn : {-1, 1}) {
+        for (int vz = -2; vz <= 2; ++vz) {
+          Vector3d cand = mid + (double)sgn * r * perp + (double)vz * resolution * Vector3d(0,0,1);
+          cand = sanitizePoint(cand);
+          if (!pointSafe(cand)) continue;
+          if (!segmentSafe(a, cand)) continue;
+          if (!segmentSafe(cand, b)) continue;
+
+          Vector3i cidx = coord2gridIndex(cand);
+          double clr = nearestObsDistM(cidx, 6);
+          if (clr > bestClr) {
+            bestClr = clr;
+            bestP = cand;
+          }
+        }
+      }
+      if (bestClr > 0.0) break;
+    }
+
+    if (bestClr <= 0.0) return false;
+    det = bestP;
+    return true;
+  };
+
+  // enforce climb angle: if nearly vertical, try detour
+  auto enforceClimb = [&](const Vector3d& a, const Vector3d& b, Vector3d& maybe_det) -> bool {
+    Vector3d d = b - a;
+    double dz = std::fabs(d.z());
+    double dxy = std::sqrt(d.x()*d.x() + d.y()*d.y());
+    if (dxy < 1e-3 && dz > 0.3) {
+      // near-vertical: must detour
+      return findDetour(a, b, maybe_det);
+    }
+    if (dxy > 1e-3 && (dz / dxy) > tan_max_climb) {
+      // too steep: try detour as well
+      return findDetour(a, b, maybe_det);
+    }
+    return false;
+  };
+
+  // strict pushChecked: NEVER insert points if the segment is unsafe
+  std::function<bool(const Vector3d&, const Vector3d&, int)> pushSeg;
+  pushSeg = [&](const Vector3d& a, const Vector3d& b, int depth) -> bool {
+    if (segmentSafe(a, b)) {
+      if ((b - out.back()).norm() > 1e-4) out.push_back(b);
+      return true;
+    }
+
+    // before splitting, see if it's a steep segment; attempt detour
+    Vector3d det;
+    if (enforceClimb(a, b, det)) {
+      if (!pushSeg(a, det, depth + 1)) return false;
+      return pushSeg(det, b, depth + 1);
+    }
+
+    // try a geometric detour even for non-steep segments
+    if (findDetour(a, b, det)) {
+      if (!pushSeg(a, det, depth + 1)) return false;
+      return pushSeg(det, b, depth + 1);
+    }
+
+    if (depth >= 8) {
+      // FAIL: do NOT force insert colliding points
+      return false;
+    }
+
+    Vector3d mid = sanitizePoint(0.5 * (a + b));
+    if (!pointSafe(mid)) return false;
+
+    if (!pushSeg(a, mid, depth + 1)) return false;
+    return pushSeg(mid, b, depth + 1);
+  };
+
+  auto pushChecked = [&](const Vector3d& target) -> bool {
+    Vector3d p = sanitizePoint(target);
+    if (!pointSafe(p)) return false;
+    return pushSeg(out.back(), p, 0);
+  };
+
+  for (size_t s = 0; s + 1 < fillet.size(); ++s) {
+    const Vector3d a0 = out.back();
+    const Vector3d b0 = fillet[s + 1];
+    Vector3d d = b0 - a0;
+    const double L = d.norm();
+    if (L < 1e-6) continue;
+    d /= L;
+
+    const double obs = forwardObstacleDist(a0, d);
+
+    double max_len = base_mid;
+    if (obs <= 1.0) max_len = base_near;
+    else if (obs <= 3.0) max_len = base_mid;
+    else max_len = base_open;
+
+    max_len = std::max(max_len, kMinSplitLenM);
+
+    int N = std::max(1, (int)std::ceil(L / max_len));
+    while (N > 1 && (L / (double)N) < kMinSplitLenM) --N;
+
+    for (int k = 1; k <= N; ++k) {
+      const double t = (double)k / (double)N;
+      Vector3d p = a0 + t * (b0 - a0);
+
+      if (!pushChecked(p)) {
+        // stop at last safe prefix; do not output unsafe tail
+        ROS_WARN("[pathSimplify] pushChecked failed. Return safe prefix only.");
+        break;
+      }
+    }
+  }
+
+  // final de-dup
+  std::vector<Vector3d> final_out;
+  final_out.reserve(out.size());
+  final_out.push_back(out.front());
+  for (size_t ii = 1; ii < out.size(); ++ii) {
+    if ((out[ii] - final_out.back()).norm() > 1e-4) final_out.push_back(out[ii]);
+  }
+
+  // 关键修复：确保终点始终是目标点
+  // 如果最后一个点不是目标点，添加目标点
+  if (g_have_cont && !final_out.empty()) {
+    Vector3d goal = sanitizePoint(g_goal_cont);
+    if ((final_out.back() - goal).norm() > 0.1) {
+      // 如果到目标点的路径是安全的，直接添加
+      if (segmentSafe(final_out.back(), goal)) {
+        final_out.push_back(goal);
+      } else {
+        // 否则保持最后一个点，但警告
+        ROS_WARN("[pathSimplify] Cannot safely reach goal, keeping last safe point.");
+      }
+    } else {
+      // 确保最后一个点精确是目标点
+      final_out.back() = goal;
+    }
+  }
+
+  ROS_INFO("[pathSimplify] in=%d clean=%d pruned=%d fillet=%d out=%d",
+           (int)path.size(), (int)clean.size(), (int)pruned.size(),
+           (int)fillet.size(), (int)final_out.size());
+
+  return final_out;
 }
 
 // ============================================================
@@ -579,27 +1237,43 @@ Vector3d Astarpath::getPosPoly(MatrixXd polyCoeff, int k, double t) {
 }
 
 int Astarpath::safeCheck(MatrixXd polyCoeff, VectorXd time) {
-  int unsafe_segment = -1;  // -1 表示整个轨迹是安全的
+  int unsafe_segment = -1;
 
-  // 使用保守的采样步长
-  double delta_t = resolution / 1.0;
+  // runtime params
+  int hard_xy_cells = 1, hard_z_cells = 0;
+  ros::param::param("~astar_hard_clearance_xy", hard_xy_cells, 1);
+  ros::param::param("~astar_hard_clearance_z",  hard_z_cells,  0);
+
+  // finer sampling
+  const double delta_t = std::max(std::min(resolution * 0.5, 0.10), 0.03);
+
+  auto insideMap = [&](const Vector3d& p) -> bool {
+    return (p(0) >= gl_xl && p(0) < gl_xu &&
+            p(1) >= gl_yl && p(1) < gl_yu &&
+            p(2) >= gl_zl && p(2) < gl_zu);
+  };
+
+  auto pointSafe = [&](const Vector3d& p) -> bool {
+    if (!insideMap(p)) return false;
+    Vector3i idx = coord2gridIndex(p);
+    if (isOccupied(idx)) return false;
+    if (isTooCloseHard(idx, hard_xy_cells, hard_z_cells)) return false;
+    return true;
+  };
+
   double t = delta_t;
   Vector3d advancePos;
-
   for (int i = 0; i < polyCoeff.rows(); i++) {
     while (t < time(i)) {
       advancePos = getPosPoly(polyCoeff, i, t);
-      if (isOccupied(coord2gridIndex(advancePos))) {
+      if (!pointSafe(advancePos)) {
         unsafe_segment = i;
         break;
       }
       t += delta_t;
     }
-    if (unsafe_segment != -1) {
-      break;
-    } else {
-      t = delta_t;
-    }
+    if (unsafe_segment != -1) break;
+    t = delta_t;
   }
   return unsafe_segment;
 }
