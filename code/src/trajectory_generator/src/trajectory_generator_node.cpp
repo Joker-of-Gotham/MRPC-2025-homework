@@ -266,6 +266,10 @@ void execCallback(const ros::TimerEvent &e)
       static ros::Time last_param_update(0.0);
       static double rmse_stop = 0.015;
       static double rmse_hold = 0.40;
+      static bool   rmse_stop_enable = true;
+      static double rmse_stop_min_time = 3.0;
+      static bool   rmse_stop_require_goal_proximity = true;
+      static double rmse_stop_goal_dist = 0.8;
       static double collision_stop_time = 0.5;
       static double collision_horizon_base = 2.5;
       static double goal_tol = 0.45;
@@ -276,6 +280,10 @@ void execCallback(const ros::TimerEvent &e)
       {
         ros::param::param("~rmse_stop", rmse_stop, rmse_stop);
         ros::param::param("~rmse_hold_time", rmse_hold, rmse_hold);
+        ros::param::param("~rmse_stop_enable", rmse_stop_enable, true);
+        ros::param::param("~rmse_stop_min_time", rmse_stop_min_time, 3.0);
+        ros::param::param("~rmse_stop_require_goal_proximity", rmse_stop_require_goal_proximity, true);
+        ros::param::param("~rmse_stop_goal_dist", rmse_stop_goal_dist, 0.8);
         ros::param::param("~collision_stop_time", collision_stop_time, collision_stop_time);
         ros::param::param("~collision_check_horizon", collision_horizon_base, collision_horizon_base);
         ros::param::param("~goal_tolerance", goal_tol, goal_tol);
@@ -286,7 +294,13 @@ void execCallback(const ros::TimerEvent &e)
       }
 
       // 若 RMSE 已经足够小并稳定一段时间，直接结束（无需强行贴到 goal 点）
-      if (rmseOkAndStable(rmse_stop, rmse_hold))
+      const double dist_to_goal_now = (target_pt - odom_pt).norm();
+      const bool rmse_gate_ok =
+        rmse_stop_enable &&
+        (t_cur >= std::max(0.0, rmse_stop_min_time)) &&
+        ((!rmse_stop_require_goal_proximity) || (dist_to_goal_now <= rmse_stop_goal_dist));
+
+      if (rmse_gate_ok && rmseOkAndStable(rmse_stop, rmse_hold))
       {
         changeState(WAIT_TARGET, "RMSE_OK");
         if (g_auto_shutdown_on_goal && !g_shutdown_scheduled)
@@ -325,7 +339,6 @@ void execCallback(const ros::TimerEvent &e)
       // 到达目标判定：增加“驻留时间”防抖，并支持到点后自动退出（便于记录总时间）
       static bool in_goal = false;
       static ros::Time goal_enter_t(0.0);
-      const double dist_to_goal_now = (target_pt - odom_pt).norm();
       if (dist_to_goal_now < goal_tol)
       {
         if (!in_goal) { in_goal = true; goal_enter_t = time_now; }

@@ -94,6 +94,11 @@
     <!-- RMSE 达标（<=0.015）即可停止 -->
     <param name="rmse_stop" value="0.015"/>
     <param name="rmse_hold_time" value="0.40"/>
+    <!-- 防止“起飞前/刚起飞 RMSE 自然很小”导致立刻退出：必须运行一段时间且接近终点才允许 RMSE_STOP -->
+    <param name="rmse_stop_enable" value="true"/>
+    <param name="rmse_stop_min_time" value="3.0"/>
+    <param name="rmse_stop_require_goal_proximity" value="true"/>
+    <param name="rmse_stop_goal_dist" value="0.8"/>
     <!-- 碰撞记录（issafe）频率：提高到 100Hz，避免高速漏检 -->
     <param name="issafe_dt" value="0.01"/>
     <!-- 轨迹安全检查采样：更细一点，降低“多项式抄近路穿障” -->
