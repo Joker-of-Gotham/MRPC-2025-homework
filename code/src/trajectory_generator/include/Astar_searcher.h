@@ -29,8 +29,8 @@ class Astarpath
 
 		double getHeu(MappingNodePtr node1, MappingNodePtr node2);
 		void AstarGetSucc(MappingNodePtr currentPtr, std::vector<MappingNodePtr> & neighborPtrSets, std::vector<double> & edgeCostSets);		
-		Eigen::Vector3d gridIndex2coord(const Eigen::Vector3i & index);
-		Eigen::Vector3i coord2gridIndex(const Eigen::Vector3d & pt);
+		Eigen::Vector3d gridIndex2coord(const Eigen::Vector3i & index) const;
+		Eigen::Vector3i coord2gridIndex(const Eigen::Vector3d & pt) const;
 		bool isOccupied(const int & idx_x, const int & idx_y, const int & idx_z) const;
 		bool isOccupied(const Eigen::Vector3i & index) const;
 		bool isFree(const int & idx_x, const int & idx_y, const int & idx_z) const;

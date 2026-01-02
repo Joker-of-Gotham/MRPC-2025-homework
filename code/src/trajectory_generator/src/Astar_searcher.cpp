@@ -184,7 +184,7 @@ vector<Vector3d> Astarpath::getVisitedNodes() {
   return visited_nodes;
 }
 
-Vector3d Astarpath::gridIndex2coord(const Vector3i &index) {
+Vector3d Astarpath::gridIndex2coord(const Vector3i &index) const {
   Vector3d pt;
   pt(0) = ((double)index(0) + 0.5) * resolution + gl_xl;
   pt(1) = ((double)index(1) + 0.5) * resolution + gl_yl;
@@ -192,7 +192,7 @@ Vector3d Astarpath::gridIndex2coord(const Vector3i &index) {
   return pt;
 }
 
-Vector3i Astarpath::coord2gridIndex(const Vector3d &pt) {
+Vector3i Astarpath::coord2gridIndex(const Vector3d &pt) const {
   Vector3i idx;
   idx << min(max(int((pt(0) - gl_xl) * inv_resolution), 0), GRID_X_SIZE - 1),
       min(max(int((pt(1) - gl_yl) * inv_resolution), 0), GRID_Y_SIZE - 1),
