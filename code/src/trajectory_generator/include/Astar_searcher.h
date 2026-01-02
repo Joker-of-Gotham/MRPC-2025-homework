@@ -63,6 +63,8 @@ class Astarpath
 		double nearestObsDistM(const Eigen::Vector3i &idx, int max_r_cells) const;
 		bool   isTooCloseHard(const Eigen::Vector3i &idx, int hard_xy_cells, int hard_z_cells) const;
 		double softClearancePenalty(const Eigen::Vector3i &idx, double soft_range_m, int soft_scan_cells) const;
+		bool   lineOfSight(const Eigen::Vector3d& start, const Eigen::Vector3d& end);
+		bool   findNearestFree(const Eigen::Vector3i &seed, Eigen::Vector3i &out_free);
 
 };
 

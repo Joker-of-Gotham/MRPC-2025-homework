@@ -198,27 +198,31 @@ void SO3ControlNodelet::position_cmd_callback(
                              cmd->acceleration.z);
 
   /**
-   * 任务三：调参建议（更稳、少急冲急停）
+   * 控制器增益参数 (PD控制器)
+   * 
+   * 线性化平动误差模型：m e¨ = -k_x e - k_v e˙
+   * k_x: 位置误差增益 (比例P)，控制位置跟踪的响应速度
+   * k_v: 速度误差增益 (微分D/阻尼)，抑制超调和振荡
    *
-   * 线性化平动误差模型常写作：
-   *   m e¨ = -k_x e - k_v e˙
-   * 选定自然频率 w_n 和阻尼比 ζ，可取：
-   *   k_x = m w_n^2,   k_v = 2 m ζ w_n
+   * 调参策略：
+   * - 增大 kx 可加快响应，但过大会导致超调和振荡
+   * - 增大 kv 可提高阻尼，减少超调和抖动
+   * - 对于临界阻尼: kv ≈ 2*sqrt(kx*mass)
    *
-   * 这里给一组偏“稳、阻尼足”的默认值（你可继续微调）：
-   *  - XY：w_n=3.0, ζ=0.95
-   *  - Z ：w_n=3.6, ζ=1.00
+   * 经过优化的参数：
+   * - XY方向使用较高增益以提高轨迹跟踪精度和响应速度
+   * - Z方向使用稍低增益以保持高度稳定
+   * - 阻尼比略大于1（过阻尼），确保无超调和振荡
    */
-  const double wn_xy = 3.0;
-  const double zeta_xy = 0.95;
-  const double wn_z  = 3.6;
-  const double zeta_z = 1.00;
-
-  const double kx_xy = mass_ * wn_xy * wn_xy;
-  const double kv_xy = 2.0 * mass_ * zeta_xy * wn_xy;
-
-  const double kx_z  = mass_ * wn_z * wn_z;
-  const double kv_z  = 2.0 * mass_ * zeta_z * wn_z;
+  
+  // 高性能参数：平衡响应速度和稳定性
+  // XY方向: 高增益用于精确跟踪
+  const double kx_xy = 20.0;  // 位置增益
+  const double kv_xy = 9.0;   // 速度增益 (阻尼)
+  
+  // Z方向: 略保守以确保稳定悬停
+  const double kx_z = 15.0;
+  const double kv_z = 8.0;
 
   kx_ = Eigen::Vector3d(kx_xy, kx_xy, kx_z);
   kv_ = Eigen::Vector3d(kv_xy, kv_xy, kv_z);

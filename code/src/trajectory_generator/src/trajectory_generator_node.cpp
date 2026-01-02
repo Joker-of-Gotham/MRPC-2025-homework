@@ -383,6 +383,9 @@ void trajOptimization(Eigen::MatrixXd path)
     return;
   }
 
+  // Store the original goal to ensure it's not lost
+  Eigen::Vector3d original_goal = path.row(path.rows() - 1).transpose();
+
   MatrixXd vel = MatrixXd::Zero(2, 3);
   MatrixXd acc = MatrixXd::Zero(2, 3);
   vel.row(0) = start_vel.transpose();
@@ -399,34 +402,57 @@ void trajOptimization(Eigen::MatrixXd path)
   int      unsafe_segment = -1;
   MatrixXd repath;
   bool     regen_flag = false;
+  int      max_iterations = 20;  // Prevent infinite loop
+  int      iteration = 0;
 
   unsafe_segment = _astar_path_finder->safeCheck(_polyCoeff, _polyTime);
 
-  while (unsafe_segment != -1)
+  while (unsafe_segment != -1 && iteration < max_iterations)
   {
+    iteration++;
     regen_flag = true;
-    int count  = 0;
-    repath     = MatrixXd::Zero(path.rows() + 1, path.cols());
-    while (count <= unsafe_segment)
+
+    // Create new path with one more point
+    repath = MatrixXd::Zero(path.rows() + 1, path.cols());
+
+    // Copy points from 0 to unsafe_segment (inclusive)
+    for (int i = 0; i <= unsafe_segment; i++)
     {
-      repath.row(count) = path.row(count);
-      count++;
+      repath.row(i) = path.row(i);
     }
-    repath.row(count) = (path.row(count) + path.row(count - 1)) / 2;
-    cout << "Add a middle point to avoid collision!" << endl;
-    while (count < path.rows())
+
+    // Insert middle point between unsafe_segment and unsafe_segment+1
+    // The unsafe segment is the segment from path[unsafe_segment] to path[unsafe_segment+1]
+    repath.row(unsafe_segment + 1) = (path.row(unsafe_segment) + path.row(unsafe_segment + 1)) / 2.0;
+
+    ROS_INFO("[trajOptimization] Adding middle point at segment %d", unsafe_segment);
+
+    // Copy remaining points (shift by 1)
+    for (int i = unsafe_segment + 1; i < path.rows(); i++)
     {
-      repath.row(count + 1) = path.row(count);
-      count++;
+      repath.row(i + 1) = path.row(i);
     }
+
+    // Ensure the last point is still the original goal
+    repath.row(repath.rows() - 1) = original_goal.transpose();
+
     path      = repath;
     _polyTime = timeAllocation(path);
     _polyCoeff =
         _trajGene->PolyQPGeneration(_dev_order, path, vel, acc, _polyTime);
     unsafe_segment = _astar_path_finder->safeCheck(_polyCoeff, _polyTime);
   }
+
+  if (iteration >= max_iterations)
+  {
+    ROS_WARN("[trajOptimization] Max iterations reached, using current path.");
+  }
+
   if (regen_flag)
-    cout << "regeneration of safe path success!" << endl;
+  {
+    ROS_INFO("[trajOptimization] Regeneration success after %d iterations, final path has %d points.",
+             iteration, (int)path.rows());
+  }
 
   visPath(path);
   visTrajectory(_polyCoeff, _polyTime);

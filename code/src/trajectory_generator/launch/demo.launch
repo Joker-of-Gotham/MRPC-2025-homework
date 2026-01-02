@@ -27,25 +27,28 @@
     <remap from="~odom"             to="/visual_slam/odom"/>
 
     <!-- 轨迹规划参数 -->
-    <param name="planning/vel"       value="3.0"/>
-    <param name="planning/acc"       value="2.0"/>
+    <!-- 速度和加速度适中，确保轨迹平滑且可执行 -->
+    <param name="planning/vel"       value="2.5"/>
+    <param name="planning/acc"       value="1.8"/>
     <param name="planning/dev_order" value="3"/>
     <param name="planning/min_order" value="3"/>
 
     <!-- 可视化与地图参数 -->
     <param name="vis/vis_traj_width" value="0.07"/>
-    <param name="map/margin"         value="0.0"/>
+    <!-- 增加安全边距，确保轨迹与障碍物保持距离 -->
+    <param name="map/margin"         value="0.2"/>
     <param name="map/resolution"     value="0.2"/>
     <param name="map/x_size"         value="$(arg map_size_x)"/>
     <param name="map/y_size"         value="$(arg map_size_y)"/>
     <param name="map/z_size"         value="$(arg map_size_z)"/>
 
     <!-- 重规划参数 -->
-    <param name="replanning/thresh_replan"    value="1.5" type="double"/>
-    <param name="replanning/thresh_no_replan" value="2.0" type="double"/>
+    <!-- 调整重规划阈值以更好地响应环境变化 -->
+    <param name="replanning/thresh_replan"    value="2.0" type="double"/>
+    <param name="replanning/thresh_no_replan" value="1.5" type="double"/>
 
     <!-- A* 路径简化分辨率 -->
-    <param name="path/resolution" value="0.2"/>
+    <param name="path/resolution" value="0.15"/>
 
     <!-- 作业里 demox 标志 -->
     <param name="planning/demox" value="0"/>

@@ -1,6 +1,17 @@
-# Vision Gain for Hummingbird
+# Optimized Gains for Hummingbird - Improved stability and tracking
+# 
+# 位置增益(pos): 控制位置误差的响应速度
+# 速度增益(vel): 提供阻尼，抑制超调和振荡
+# 旋转增益(rot): 控制姿态误差的响应
+# 角速度增益(ang): 提供角速度阻尼
+#
+# 调参原则:
+# - 增大pos/vel可提高轨迹跟踪精度，但过大会导致振荡
+# - rot/ang控制姿态响应，影响飞行稳定性
+# - 对于临界阻尼: vel ≈ 2*sqrt(pos*mass)
+#
 gains:
-  pos: {x: 2.0, y: 2.0, z: 3.5}
-  vel: {x: 1.8, y: 1.8, z: 2.0}
-  rot: {x: 1.0, y: 1.0, z: 0.3}
-  ang: {x: 0.07, y: 0.07, z: 0.02}  
+  pos: {x: 20.0, y: 20.0, z: 15.0}
+  vel: {x: 9.0, y: 9.0, z: 8.0}
+  rot: {x: 1.8, y: 1.8, z: 1.0}
+  ang: {x: 0.15, y: 0.15, z: 0.10}
